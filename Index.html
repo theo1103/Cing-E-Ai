@@ -1,776 +1,1900 @@
-<?php
-/**
- * Network Technology Tools v5.2 – Single‑File Edition
- * Letakkan di htdocs, akses langsung.
- * Pastikan ekstensi PHP: sqlite3, zip, dom, mbstring aktif.
- */
-session_start();
-error_reporting(0);
-ini_set('display_errors', 0);
-date_default_timezone_set('Asia/Jakarta');
-
-// ---------- KONFIGURASI & AUTO‑CREATE FOLDER ----------
-define('BASE_PATH', __DIR__);
-define('DB_PATH', BASE_PATH . '/_db');
-define('UPLOADS_PATH', BASE_PATH . '/_uploads');
-define('FOLDER_DB_PATH', BASE_PATH . '/folder_db');
-foreach ([DB_PATH, UPLOADS_PATH, FOLDER_DB_PATH] as $dir) {
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0755, true);
-        @file_put_contents($dir . '/index.html', '');
-    }
-}
-define('DB_FILE', DB_PATH . '/db_user.sqlite');
-define('HASH_COST', 12);
-define('ADMIN_USER', 'theo');
-define('ADMIN_PASS', 'theo@2026');        // Ganti setelah instalasi
-define('ADMIN_EMAIL', 'admin@local');
-
-// ---------- DATABASE SQLITE UNTUK USER ----------
-function getDB() {
-    static $pdo = null;
-    if ($pdo === null) {
-        try {
-            $pdo = new PDO('sqlite:' . DB_FILE);
-            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-            $pdo->exec('PRAGMA journal_mode=WAL');
-        } catch (PDOException $e) { die('Database error'); }
-    }
-    return $pdo;
-}
-function initDB() {
-    $db = getDB();
-    $db->exec("CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        full_name TEXT DEFAULT '',
-        role TEXT DEFAULT 'user',
-        status TEXT DEFAULT 'pending',
-        approved_by TEXT DEFAULT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        last_login DATETIME,
-        login_count INTEGER DEFAULT 0,
-        theme TEXT DEFAULT 'dark'
-    )");
-    $db->exec("CREATE TABLE IF NOT EXISTS notifications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        message TEXT,
-        type TEXT DEFAULT 'info',
-        is_read INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )");
-    $db->exec("CREATE TABLE IF NOT EXISTS activity_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        action TEXT,
-        details TEXT,
-        ip_address TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )");
-    // Buat admin default jika belum ada
-    $stmt = $db->prepare("SELECT id FROM users WHERE username = ?");
-    $stmt->execute([ADMIN_USER]);
-    if (!$stmt->fetch()) {
-        $hashed = password_hash(ADMIN_PASS, PASSWORD_BCRYPT, ['cost' => HASH_COST]);
-        $db->prepare("INSERT INTO users (username,password,email,full_name,role,status) VALUES (?,?,?,?,?,?)")
-           ->execute([ADMIN_USER, $hashed, ADMIN_EMAIL, 'Administrator', 'admin', 'approved']);
-    }
-}
-initDB();
-
-// ---------- FUNGSI UMUM ----------
-function h($s) { return htmlspecialchars($s ?? '', ENT_QUOTES, 'UTF-8'); }
-function csrf_token() {
-    if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32));
-    return $_SESSION['csrf'];
-}
-function verify_csrf($token) { return hash_equals($_SESSION['csrf'] ?? '', $token ?? ''); }
-function is_logged() { return !empty($_SESSION['user_id']); }
-function is_admin() { return ($_SESSION['user_role'] ?? '') === 'admin'; }
-function require_login() { if (!is_logged()) { header('Location: ?login'); exit; } }
-function login($u, $p) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT * FROM users WHERE username = ? AND status = 'approved'");
-    $stmt->execute([$u]);
-    $user = $stmt->fetch();
-    if ($user && password_verify($p, $user['password'])) {
-        session_regenerate_id(true);
-        $_SESSION['user_id'] = $user['id'];
-        $_SESSION['username'] = $user['username'];
-        $_SESSION['user_role'] = $user['role'];
-        $_SESSION['user_theme'] = $user['theme'];
-        $db->prepare("UPDATE users SET last_login=CURRENT_TIMESTAMP, login_count=login_count+1 WHERE id=?")->execute([$user['id']]);
-        $db->prepare("INSERT INTO activity_log (user_id,action,ip_address) VALUES (?,?,?)")->execute([$user['id'],'login',$_SERVER['REMOTE_ADDR']]);
-        return true;
-    }
-    return false;
-}
-function register_user($data) {
-    $db = getDB();
-    $hashed = password_hash($data['password'], PASSWORD_BCRYPT, ['cost' => HASH_COST]);
-    $stmt = $db->prepare("INSERT INTO users (username,password,email,full_name,role,status) VALUES (?,?,?,?,?,?)");
-    $stmt->execute([$data['username'], $hashed, $data['email'], $data['full_name'], 'user', 'pending']);
-    $admin_id = $db->query("SELECT id FROM users WHERE role='admin' LIMIT 1")->fetchColumn();
-    if ($admin_id) {
-        $db->prepare("INSERT INTO notifications (user_id,message,type) VALUES (?,?,?)")
-           ->execute([$admin_id, "New registration: {$data['username']} ({$data['email']})", 'new_registration']);
-    }
-}
-
-// ---------- FUNGSI EXCEL (CSV & XLSX) ----------
-function parseExcel($filePath) {
-    $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-    if ($ext === 'csv') {
-        $rows = [];
-        if (($handle = fopen($filePath, 'r')) !== false) {
-            $headers = fgetcsv($handle);
-            if (!$headers) return [];
-            $headers = array_map('trim', $headers);
-            while (($row = fgetcsv($handle)) !== false) {
-                $r = [];
-                foreach ($headers as $i => $h) $r[$h] = $row[$i] ?? '';
-                $rows[] = $r;
-            }
-            fclose($handle);
-        }
-        return $rows;
-    } elseif (in_array($ext, ['xlsx', 'xls'])) {
-        if ($ext === 'xlsx' && class_exists('ZipArchive')) {
-            $zip = new ZipArchive();
-            if ($zip->open($filePath) === true) {
-                $sharedStrings = [];
-                if (($ssXml = $zip->getFromName('xl/sharedStrings.xml')) !== false) {
-                    $ssDom = new DOMDocument();
-                    $ssDom->loadXML($ssXml);
-                    foreach ($ssDom->getElementsByTagName('si') as $si) $sharedStrings[] = $si->textContent;
-                }
-                $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
-                if ($sheetXml) {
-                    $sheetDom = new DOMDocument();
-                    $sheetDom->loadXML($sheetXml);
-                    $rows = $sheetDom->getElementsByTagName('row');
-                    $headers = [];
-                    $data = [];
-                    $rowIdx = 0;
-                    foreach ($rows as $row) {
-                        $cells = $row->getElementsByTagName('c');
-                        $rowData = [];
-                        $colIdx = 0;
-                        foreach ($cells as $cell) {
-                            $type = $cell->getAttribute('t');
-                            $v = $cell->getElementsByTagName('v')->item(0);
-                            $val = '';
-                            if ($v) {
-                                $val = $v->textContent;
-                                if ($type === 's' && isset($sharedStrings[(int)$val])) $val = $sharedStrings[(int)$val];
-                            }
-                            if ($rowIdx === 0) $headers[$colIdx] = $val;
-                            else $rowData[$headers[$colIdx] ?? "col$colIdx"] = $val;
-                            $colIdx++;
-                        }
-                        if ($rowIdx > 0) $data[] = $rowData;
-                        $rowIdx++;
-                    }
-                    $zip->close();
-                    return $data;
-                }
-                $zip->close();
-            }
-        }
-    }
-    return [];
-}
-
-// ---------- CMDB JSON HANDLER ----------
-function cmdbFilePath() { return FOLDER_DB_PATH . '/cmdb_database.json'; }
-function loadCmdb() {
-    $file = cmdbFilePath();
-    if (!file_exists($file)) return [];
-    $size = filesize($file);
-    if ($size > 5 * 1024 * 1024) {
-        $all = [];
-        $i = 0;
-        while (file_exists(FOLDER_DB_PATH . "/cmdb_chunk_{$i}.json")) {
-            $chunk = json_decode(file_get_contents(FOLDER_DB_PATH . "/cmdb_chunk_{$i}.json"), true);
-            if ($chunk) $all = array_merge($all, $chunk);
-            $i++;
-        }
-        return $all;
-    }
-    return json_decode(file_get_contents($file), true) ?: [];
-}
-function saveCmdb(array $data, $chunkSize = 5000) {
-    foreach (glob(FOLDER_DB_PATH . '/cmdb_chunk_*.json') as $f) unlink($f);
-    file_put_contents(cmdbFilePath(), json_encode($data, JSON_PRETTY_PRINT));
-    $chunks = array_chunk($data, $chunkSize);
-    foreach ($chunks as $i => $chunk) {
-        file_put_contents(FOLDER_DB_PATH . "/cmdb_chunk_{$i}.json", json_encode($chunk, JSON_PRETTY_PRINT));
-    }
-}
-
-// ---------- DOWNLOAD CSV ----------
-if (isset($_GET['download'])) {
-    require_login();
-    $type = $_GET['type'] ?? '';
-    if ($type === 'mapping') {
-        $circle = $_GET['circle'] ?? 'all';
-        $data = loadCmdb();
-        if ($circle !== 'all') $data = array_values(array_filter($data, fn($r) => ($r['Circle ID'] ?? '') == $circle));
-        header('Content-Type: text/csv');
-        header('Content-Disposition: attachment; filename="mapping_'.date('Ymd_His').'.csv"');
-        $out = fopen('php://output', 'w');
-        if (!empty($data)) {
-            fputcsv($out, array_keys($data[0]));
-            foreach ($data as $row) fputcsv($out, $row);
-        }
-        fclose($out);
-        exit;
-    } elseif ($type === 'compiled' && isset($_GET['file'])) {
-        $file = basename($_GET['file']);
-        $path = UPLOADS_PATH . '/' . $file;
-        if (file_exists($path)) {
-            header('Content-Type: text/csv');
-            header('Content-Disposition: attachment; filename="' . $file . '"');
-            readfile($path);
-            exit;
-        }
-    } elseif ($type === 'validation' && isset($_GET['file'])) {
-        $file = basename($_GET['file']);
-        $path = UPLOADS_PATH . '/' . $file;
-        if (file_exists($path)) {
-            header('Content-Type: text/csv');
-            header('Content-Disposition: attachment; filename="' . $file . '"');
-            readfile($path);
-            exit;
-        }
-    }
-    exit('Invalid download');
-}
-
-// ---------- PROSES FORM LOGIN/REGISTER ----------
-$error = $success = '';
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_POST['action']) && $_POST['action'] === 'login') {
-        if (!verify_csrf($_POST['csrf'] ?? '')) $error = 'Invalid CSRF';
-        elseif (login($_POST['username'], $_POST['password'])) { header('Location: ?'); exit; }
-        else $error = 'Invalid credentials or account not approved.';
-    }
-    elseif (isset($_POST['action']) && $_POST['action'] === 'register') {
-        if (!verify_csrf($_POST['csrf'] ?? '')) $error = 'Invalid CSRF';
-        else {
-            if (strlen($_POST['password']) < 8) $error = 'Password minimal 8 karakter.';
-            else {
-                register_user([
-                    'full_name' => $_POST['full_name'],
-                    'username' => $_POST['username'],
-                    'email' => $_POST['email'],
-                    'password' => $_POST['password'],
-                ]);
-                header('Location: ?login&registered=1'); exit;
-            }
-        }
-    }
-}
-
-// ---------- HALAMAN LOGIN/REGISTER (jika belum login) ----------
-if (!is_logged()) {
-    $mode = isset($_GET['register']) ? 'register' : 'login';
-    ?>
-    <!DOCTYPE html>
-    <html data-theme="dark">
-    <head><title>Network Tech Tools - Login</title>
-    <style>
-        :root { --bg:#0a0e17; --card:rgba(17,24,39,0.9); --text:#e2e8f0; --accent:#00d4ff; }
-        *{margin:0;padding:0;box-sizing:border-box;}
-        body{background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;background:linear-gradient(135deg, #0a0e17 0%, #1a1a2e 100%);}
-        .card{background:var(--card);border-radius:20px;padding:40px;width:100%;max-width:400px;backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.1);}
-        input{width:100%;padding:12px;margin:8px 0;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:var(--text);}
-        button{width:100%;padding:12px;background:var(--accent);border:none;border-radius:8px;font-weight:bold;cursor:pointer;margin-top:10px;transition:0.3s;}
-        button:hover{opacity:0.9;}
-        .alert{padding:10px;border-radius:6px;margin-bottom:10px;}
-        .error{background:#7f1d1d;color:#fca5a5;}
-        .success{background:#064e3b;color:#6ee7b7;}
-        a{color:var(--accent);}
-    </style>
-    </head>
-    <body>
-    <div class="card">
-        <h2 style="text-align:center;">📡 Network Tech Tools</h2>
-        <?php if($error): ?><div class="alert error"><?=$error?></div><?php endif; ?>
-        <?php if(isset($_GET['registered'])): ?><div class="alert success">Registrasi berhasil. Silakan login setelah disetujui admin.</div><?php endif; ?>
-        <?php if($mode === 'login'): ?>
-            <form method="post">
-                <input type="hidden" name="action" value="login">
-                <input type="hidden" name="csrf" value="<?=csrf_token()?>">
-                <input type="text" name="username" placeholder="Username" required>
-                <input type="password" name="password" placeholder="Password" required>
-                <button type="submit">Sign In</button>
-            </form>
-            <p style="text-align:center;margin-top:10px;">Belum punya akun? <a href="?register">Daftar</a></p>
-        <?php else: ?>
-            <form method="post">
-                <input type="hidden" name="action" value="register">
-                <input type="hidden" name="csrf" value="<?=csrf_token()?>">
-                <input type="text" name="full_name" placeholder="Nama Lengkap" required>
-                <input type="text" name="username" placeholder="Username" required>
-                <input type="email" name="email" placeholder="Email" required>
-                <input type="password" name="password" placeholder="Password (min 8)" required>
-                <button type="submit">Daftar</button>
-            </form>
-            <p style="text-align:center;margin-top:10px;">Sudah punya akun? <a href="?login">Masuk</a></p>
-        <?php endif; ?>
-    </div>
-    </body>
-    </html>
-    <?php
-    exit;
-}
-
-// ---------- USER SUDAH LOGIN ----------
-require_login();
-$user = getDB()->prepare("SELECT * FROM users WHERE id=?")->execute([$_SESSION['user_id']])->fetch();
-if (($_GET['action'] ?? '') === 'logout') {
-    session_destroy();
-    header('Location: ?login');
-    exit;
-}
-if (isset($_GET['theme'])) {
-    $newTheme = $_GET['theme'] === 'light' ? 'light' : 'dark';
-    getDB()->prepare("UPDATE users SET theme=? WHERE id=?")->execute([$newTheme, $_SESSION['user_id']]);
-    $_SESSION['user_theme'] = $newTheme;
-    header('Location: ?');
-    exit;
-}
-$theme = $_SESSION['user_theme'] ?? 'dark';
-
-// Routing halaman
-$page = $_GET['page'] ?? 'home';
-$allowed = ['home','adm_user','mailing_news','tools_ran','massive_incident','tools_compiler','tools_mapping','tools_validate','main_tools','knowledge'];
-if (!in_array($page, $allowed)) $page = 'home';
-if ($page === 'adm_user' && !is_admin()) $page = 'home';
-
-// Include konten halaman
-ob_start();
-switch ($page) {
-    case 'home': include_page_home(); break;
-    case 'adm_user': include_page_admin_users(); break;
-    case 'mailing_news': include_page_mailing(); break;
-    case 'tools_ran': include_page_ran(); break;
-    case 'massive_incident': include_page_incident(); break;
-    case 'tools_compiler': include_page_compiler(); break;
-    case 'tools_mapping': include_page_mapping(); break;
-    case 'tools_validate': include_page_validate(); break;
-    case 'main_tools': include_page_maintools(); break;
-    case 'knowledge': include_page_knowledge(); break;
-}
-$content = ob_get_clean();
-
-// Peringatan jika CMDB kosong untuk beberapa halaman
-$cmdb_warning = '';
-if (in_array($page, ['tools_ran','massive_incident','tools_mapping']) && empty(loadCmdb())) {
-    $cmdb_warning = '<script>alert("⚠️ Database CMDB belum diupload. Silakan upload melalui Main Tools terlebih dahulu.");</script>';
-}
-?>
 <!DOCTYPE html>
-<html data-theme="<?=$theme?>">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Network Technology Tools</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <title>Cing E Ai Tools - Dashboard Analytics</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js">
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js">
+    </script>
     <style>
         :root {
-            --sidebar-w: 260px; --header-h: 60px;
-            --bg: #0a0e17; --bg2: #111827; --card: rgba(17,24,39,0.8);
-            --text: #e2e8f0; --text2: #94a3b8; --accent: #00d4ff;
-            --border: rgba(255,255,255,0.06); --hover: rgba(255,255,255,0.03);
+            --bg: #f0f4f8;
+            --card-bg: #ffffff;
+            --primary: #1a73e8;
+            --primary-light: #e8f0fe;
+            --text: #1f2937;
+            --text-secondary: #6b7280;
+            --border: #e5e7eb;
+            --accent1: #3b82f6;
+            --accent2: #ef4444;
+            --accent3: #10b981;
+            --accent4: #f59e0b;
+            --accent5: #8b5cf6;
+            --shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+            --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.08), 0 4px 10px rgba(0, 0, 0, 0.04);
+            --radius: 14px;
+            --radius-sm: 8px;
+            --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
         }
-        [data-theme="light"] {
-            --bg: #f8fafc; --bg2: #fff; --card: rgba(255,255,255,0.9);
-            --text: #1e293b; --text2: #64748b; --border: rgba(0,0,0,0.08); --hover: rgba(0,0,0,0.02);
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        *{margin:0;padding:0;box-sizing:border-box;}
-        body{font-family:'Segoe UI', system-ui, sans-serif; background:var(--bg); color:var(--text); display:flex; min-height:100vh; transition: background 0.3s;}
-        .sidebar{width:var(--sidebar-w); height:100vh; position:fixed; left:0; top:0; background:var(--bg2); border-right:1px solid var(--border); display:flex; flex-direction:column; z-index:100; overflow-y:auto; padding:20px 0; transition: transform 0.3s;}
-        .sidebar a, .sidebar button{display:flex; align-items:center; gap:8px; padding:10px 16px; margin:2px 8px; border-radius:8px; color:var(--text2); text-decoration:none; font-size:0.9rem; background:none; border:none; width:calc(100% - 16px); cursor:pointer; text-align:left; transition: 0.2s;}
-        .sidebar a:hover, .sidebar a.active{background:var(--hover); color:var(--text);}
-        .sidebar a.active{background:rgba(0,212,255,0.1); color:var(--accent); font-weight:600;}
-        .badge{background:#ef4444; color:white; border-radius:10px; padding:2px 8px; font-size:0.7rem; margin-left:auto;}
-        .submenu{display:none; padding-left:16px;}
-        .submenu.open{display:block;}
-        .main{margin-left:var(--sidebar-w); flex:1; display:flex; flex-direction:column; transition: margin 0.3s;}
-        .topbar{height:var(--header-h); background:var(--bg2); border-bottom:1px solid var(--border); display:flex; align-items:center; padding:0 20px; gap:12px; position:sticky; top:0; z-index:50;}
-        .content{flex:1; padding:20px; overflow-y:auto; animation: fadeIn 0.4s;}
-        @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
-        .card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:20px; margin-bottom:20px; backdrop-filter:blur(8px);}
-        .btn{display:inline-block; padding:8px 16px; background:var(--accent); color:#000; border:none; border-radius:8px; cursor:pointer; text-decoration:none; font-weight:600; transition:0.2s;}
-        .btn:hover{opacity:0.9; transform:translateY(-1px);}
-        .btn-sm{padding:4px 10px; font-size:0.85rem;}
-        .btn-danger{background:#ef4444; color:white;}
-        table{width:100%; border-collapse:collapse;}
-        th, td{padding:10px; border-bottom:1px solid var(--border); text-align:left; font-size:0.9rem;}
-        th{background:var(--hover); position:sticky; top:0;}
-        input, select, textarea{background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:10px; color:var(--text); width:100%; margin:4px 0;}
-        .alert{padding:12px; border-radius:8px; margin-bottom:16px;}
-        .alert-success{background:rgba(16,185,129,0.2); color:#6ee7b7;}
-        .alert-error{background:rgba(239,68,68,0.2); color:#fca5a5;}
-        #globalLoader{position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); display:none; align-items:center; justify-content:center; z-index:9999;}
-        .loader{width:50px; height:50px; border:3px solid rgba(255,255,255,0.2); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite;}
-        @keyframes spin { to{transform:rotate(360deg);} }
+
+        body {
+            font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #1e3a5f 0%, #1a5c8a 40%, #1a73e8 100%);
+            color: #fff;
+            padding: 20px 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 16px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .header h1 .icon {
+            width: 40px;
+            height: 40px;
+            background: rgba(255, 255, 255, 0.18);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.3rem;
+        }
+        .header-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 10px 18px;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.875rem;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+            letter-spacing: 0.01em;
+        }
+        .btn-outline {
+            background: rgba(255, 255, 255, 0.15);
+            color: #fff;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+        }
+        .btn-outline:hover {
+            background: rgba(255, 255, 255, 0.28);
+            border-color: rgba(255, 255, 255, 0.5);
+            transform: translateY(-1px);
+        }
+        .btn-primary {
+            background: #fff;
+            color: #1a5c8a;
+        }
+        .btn-primary:hover {
+            background: #e8f0fe;
+            transform: translateY(-1px);
+        }
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+        }
+        .file-input-wrapper input[type="file"] {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        /* Container */
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 24px 20px;
+        }
+
+        /* Stats row */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: var(--card-bg);
+            border-radius: var(--radius);
+            padding: 20px 24px;
+            box-shadow: var(--shadow);
+            border: 1px solid var(--border);
+            transition: var(--transition);
+        }
+        .stat-card:hover {
+            box-shadow: var(--shadow-lg);
+            transform: translateY(-2px);
+        }
+        .stat-card .stat-label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .stat-card .stat-value {
+            font-size: 2rem;
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            color: var(--text);
+        }
+        .stat-card .stat-sub {
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        /* Card */
+        .card {
+            background: var(--card-bg);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            border: 1px solid var(--border);
+            padding: 20px 24px;
+            margin-bottom: 20px;
+            transition: var(--transition);
+        }
+        .card:hover {
+            box-shadow: var(--shadow-lg);
+        }
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .card-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-title .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        /* Grid */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .grid-3 {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 900px) {
+            .grid-2,
+            .grid-3 {
+                grid-template-columns: 1fr;
+            }
+            .header h1 {
+                font-size: 1.2rem;
+            }
+            .stats-row {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        @media (max-width: 500px) {
+            .stats-row {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Table */
+        .table-wrapper {
+            overflow-x: auto;
+            max-height: 520px;
+            overflow-y: auto;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.82rem;
+            min-width: 600px;
+        }
+        table thead {
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        table thead th {
+            background: #f8fafc;
+            color: var(--text);
+            font-weight: 700;
+            padding: 12px 14px;
+            text-align: left;
+            border-bottom: 2px solid var(--border);
+            white-space: nowrap;
+            font-size: 0.76rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        table tbody td {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+        table tbody tr {
+            transition: background 0.15s;
+        }
+        table tbody tr:hover {
+            background: #f1f5f9;
+        }
+        table tbody tr:nth-child(even) {
+            background: #fafbfc;
+        }
+        table tbody tr:nth-child(even):hover {
+            background: #f1f5f9;
+        }
+        .highlight-cell {
+            font-weight: 700;
+            color: var(--accent1);
+            text-align: center;
+        }
+        .count-badge {
+            display: inline-block;
+            background: var(--primary-light);
+            color: var(--primary);
+            border-radius: 20px;
+            padding: 3px 10px;
+            font-weight: 700;
+            font-size: 0.78rem;
+            min-width: 32px;
+            text-align: center;
+        }
+        .count-badge.high {
+            background: #fef2f2;
+            color: #dc2626;
+        }
+        .count-badge.medium {
+            background: #fffbeb;
+            color: #d97706;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+            background: #f1f5f9;
+            border-radius: 25px;
+            padding: 4px;
+            display: inline-flex;
+        }
+        .tab-btn {
+            padding: 9px 20px;
+            border: none;
+            background: transparent;
+            border-radius: 22px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.82rem;
+            transition: var(--transition);
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+        .tab-btn.active {
+            background: #fff;
+            color: var(--primary);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+        .tab-btn:hover:not(.active) {
+            color: var(--text);
+            background: rgba(255, 255, 255, 0.5);
+        }
+
+        /* Chart container */
+        .chart-container {
+            position: relative;
+            width: 100%;
+            height: 380px;
+        }
+        .chart-container.tall {
+            height: 460px;
+        }
+        canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+
+        /* Select */
+        select {
+            padding: 8px 14px;
+            border-radius: 20px;
+            border: 1.5px solid var(--border);
+            font-size: 0.85rem;
+            font-weight: 500;
+            background: #fff;
+            cursor: pointer;
+            transition: var(--transition);
+            color: var(--text);
+        }
+        select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.1);
+        }
+
+        /* Footer */
+        .footer {
+            text-align: center;
+            padding: 16px;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+
+        /* Loading */
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-secondary);
+        }
+        .loading .spinner {
+            width: 36px;
+            height: 36px;
+            border: 3px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin: 0 auto 12px;
+        }
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        /* Tooltip-like */
+        .info-tag {
+            display: inline-block;
+            font-size: 0.7rem;
+            background: #e8f0fe;
+            color: #1a73e8;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 600;
+        }
+
+        /* Empty state */
+        .empty-state {
+            text-align: center;
+            padding: 48px 20px;
+            color: var(--text-secondary);
+        }
+        .empty-state .icon {
+            font-size: 3rem;
+            margin-bottom: 12px;
+        }
     </style>
 </head>
 <body>
-<div id="globalLoader"><div class="loader"></div></div>
-<aside class="sidebar" id="sidebar">
-    <div style="padding:0 16px 20px; border-bottom:1px solid var(--border); margin-bottom:10px;">
-        <div style="font-size:1.5rem;">📡</div>
-        <strong>Network Tech Tools</strong>
-    </div>
-    <a href="?page=home" class="<?=$page=='home'?'active':''?>">🏠 Home</a>
-    <?php if(is_admin()): ?>
-    <a href="?page=adm_user" class="<?=$page=='adm_user'?'active':''?>">👥 User Approval <?php $p = getDB()->query("SELECT count(*) FROM users WHERE status='pending'")->fetchColumn(); if($p) echo "<span class='badge'>$p</span>"; ?></a>
-    <?php endif; ?>
-    <a href="?page=mailing_news" class="<?=$page=='mailing_news'?'active':''?>">📧 Mailing & News</a>
-    <button onclick="toggleSubmenu()" class="nav-item">🔧 Tools Suite ▾</button>
-    <div id="submenu" class="submenu <?=in_array($page,['tools_ran','massive_incident','tools_compiler','tools_mapping','tools_validate','main_tools'])?'open':''?>">
-        <a href="?page=tools_ran" class="<?=$page=='tools_ran'?'active':''?>">📊 Tools RAN</a>
-        <a href="?page=massive_incident" class="<?=$page=='massive_incident'?'active':''?>">⚠️ Massive Incident</a>
-        <a href="?page=tools_compiler" class="<?=$page=='tools_compiler'?'active':''?>">📑 Tools Compiler</a>
-        <a href="?page=tools_mapping" class="<?=$page=='tools_mapping'?'active':''?>">🗺️ Mapping Long Lat</a>
-        <a href="?page=tools_validate" class="<?=$page=='tools_validate'?'active':''?>">✅ Validate LTOA OWS</a>
-        <a href="?page=main_tools" class="<?=$page=='main_tools'?'active':''?>">💾 Main Tools (CMDB)</a>
-    </div>
-    <a href="?page=knowledge" class="<?=$page=='knowledge'?'active':''?>">📚 Knowledge Base</a>
-    <a href="?action=logout" style="color:#ef4444;">🚪 Logout</a>
-</aside>
 
-<div class="main">
-    <header class="topbar">
-        <button onclick="document.getElementById('sidebar').classList.toggle('open')" style="display:none; background:none; border:none; font-size:1.5rem; color:var(--text);">☰</button>
-        <span id="weather">⏳</span>
-        <span style="flex:1;"></span>
-        <span id="clock"></span>
-        <a href="?theme=<?=$theme=='dark'?'light':'dark'?>" style="font-size:1.4rem; text-decoration:none;"><?=$theme=='dark'?'☀️':'🌙'?></a>
-        <span style="margin-left:8px;"><?=h($user['username'])?></span>
+    <!-- Header -->
+    <header class="header">
+        <h1>
+            <span class="icon">📡</span>
+            Cing E Ai Tools — Analytics
+        </h1>
+        <div class="header-actions">
+            <div class="file-input-wrapper">
+                <button class="btn btn-outline">📂 Upload New Excel</button>
+                <input type="file" id="fileUpload" accept=".xlsx,.xls,.csv">
+            </div>
+            <button class="btn btn-primary" onclick="exportPivotCSV()">📥 Export CSV</button>
+            <button class="btn btn-outline" onclick="resetToDefault()">🔄 Reset</button>
+        </div>
     </header>
-    <div class="content">
-        <?=$content?>
+
+    <!-- Main Content -->
+    <div class="container" id="mainContent">
+
+        <!-- Stats Row -->
+        <div class="stats-row" id="statsRow">
+            <div class="stat-card">
+                <div class="stat-label">📋 Total Sites</div>
+                <div class="stat-value" id="statTotalSites">-</div>
+                <div class="stat-sub">unique site_id entries</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">🌐 Unique Circles</div>
+                <div class="stat-value" id="statCircles">-</div>
+                <div class="stat-sub">distinct circle values</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">🏢 MC Clusters</div>
+                <div class="stat-value" id="statClusters">-</div>
+                <div class="stat-sub">distinct mc_cluster values</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">⚠️ Above 24h</div>
+                <div class="stat-value" id="statAbove24">-</div>
+                <div class="stat-sub">sites down > 24 hours</div>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div style="margin-bottom: 20px;">
+            <div class="tabs" id="tabButtons">
+                <button class="tab-btn active" data-tab="overview">📊 Overview</button>
+                <button class="tab-btn" data-tab="pivot">📋 Pivot Table</button>
+                <button class="tab-btn" data-tab="detail">🔍 Detail Data</button>
+            </div>
+        </div>
+
+        <!-- Tab: Overview -->
+        <div id="tab-overview" class="tab-content">
+            <!-- Charts Row -->
+            <div class="grid-2">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title"><span class="dot" style="background:#3b82f6;"></span> Top Circles by Site Count</span>
+                        <select id="topCircleLimit" onchange="renderOverviewCharts()">
+                            <option value="10">Top 10</option>
+                            <option value="15" selected>Top 15</option>
+                            <option value="20">Top 20</option>
+                            <option value="0">All</option>
+                        </select>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="chartCircleBar"></canvas>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title"><span class="dot" style="background:#ef4444;"></span> Top MC Clusters by Site Count</span>
+                        <select id="topClusterLimit" onchange="renderOverviewCharts()">
+                            <option value="10">Top 10</option>
+                            <option value="15" selected>Top 15</option>
+                            <option value="20">Top 20</option>
+                            <option value="0">All</option>
+                        </select>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="chartClusterBar"></canvas>
+                    </div>
+                </div>
+            </div>
+            <div class="grid-2">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title"><span class="dot" style="background:#10b981;"></span> Circle Distribution (Pie)</span>
+                    </div>
+                    <div class="chart-container tall">
+                        <canvas id="chartCirclePie"></canvas>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title"><span class="dot" style="background:#f59e0b;"></span> MC Cluster Distribution (Pie)</span>
+                    </div>
+                    <div class="chart-container tall">
+                        <canvas id="chartClusterPie"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Pivot Table -->
+        <div id="tab-pivot" class="tab-content" style="display:none;">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📋 Pivot Table: Circle × MC Cluster (Site Count)</span>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                        <select id="pivotCircleFilter" onchange="renderPivotTable()">
+                            <option value="">All Circles</option>
+                        </select>
+                        <select id="pivotClusterFilter" onchange="renderPivotTable()">
+                            <option value="">All MC Clusters</option>
+                        </select>
+                        <span class="info-tag">Scroll for more →</span>
+                    </div>
+                </div>
+                <div class="table-wrapper" id="pivotTableWrapper">
+                    <p class="loading"><div class="spinner"></div>Loading pivot table...</p>
+                </div>
+            </div>
+            <!-- Heatmap -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔥 Circle × MC Cluster Heatmap (Top 20 × Top 15)</span>
+                </div>
+                <div class="chart-container tall">
+                    <canvas id="chartHeatmap"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Detail -->
+        <div id="tab-detail" class="tab-content" style="display:none;">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔍 Raw Data Summary by Circle & MC Cluster</span>
+                    <input type="text" id="detailSearch" placeholder="🔎 Search circle or cluster..." style="padding:8px 14px;border-radius:20px;border:1.5px solid #e5e7eb;font-size:0.85rem;width:220px;" oninput="renderDetailTable()">
+                </div>
+                <div class="table-wrapper" id="detailTableWrapper" style="max-height:600px;">
+                    <p class="loading"><div class="spinner"></div>Loading detail...</p>
+                </div>
+            </div>
+        </div>
+
     </div>
-</div>
 
-<?=$cmdb_warning?>
+    <div class="footer">
+        Cing E Ai Tools Dashboard · Data sourced from Excel export · <span id="dataTimestamp"></span>
+    </div>
 
-<script>
-    window.showLoader = () => document.getElementById('globalLoader').style.display = 'flex';
-    window.hideLoader = () => document.getElementById('globalLoader').style.display = 'none';
-    window.addEventListener('load', hideLoader);
-    document.querySelectorAll('form').forEach(f => f.addEventListener('submit', showLoader));
+    <script>
+        // ============ EMBEDDED DATA (parsed from the Excel table) ============
+        const RAW_DATA = [
+            { site_id: "13BDG0409", mc_cluster: "MC-KOTA BANDUNG TIMUR", circle: "JAYA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "04BLS0015", mc_cluster: "MC-DUMAI", circle: "SUMATERA", duration_range: "m24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "11CRS0296", mc_cluster: "MC-SERANG BARAT", circle: "JAYA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "15YOG0111", mc_cluster: "MC-YOGYAKARTA", circle: "JAVA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "30KKA0044", mc_cluster: "MC-KOLAKA", circle: "KALISUMAPA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "14PBG0051", mc_cluster: "MC-PURBALINGGA", circle: "JAVA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "34BTI0001", mc_cluster: "MC-MANOKWARI", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "11PDG0238", mc_cluster: "MC-PANDEGLANG SELATAN", circle: "JAYA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "16BKN0108", mc_cluster: "MC-BANGKALAN", circle: "JAVA", duration_range: "m24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKP0089", mc_cluster: "MC-JAKARTA PUSAT", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13CBN0775", mc_cluster: "MC-CIJERUK", circle: "JAYA", duration_range: "m24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKT0662", mc_cluster: "MC-CAKUNG", circle: "JAYA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "13BKS0134", mc_cluster: "MC-PONDOK GEDE", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13CRN0218", mc_cluster: "MC-CIREBON TIMUR", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13DPK0364", mc_cluster: "MC-DEPOK TIMUR", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "11CRS0338", mc_cluster: "MC-SERANG TIMUR", circle: "JAYA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "13DPK0472", mc_cluster: "MC-DEPOK TIMUR", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKU0476", mc_cluster: "MC-KELAPA GADING", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "04PKR0065", mc_cluster: "MC-PELALAWAN", circle: "SUMATERA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "08BKL0098", mc_cluster: "MC-BENGKULU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21MTW0024", mc_cluster: "MC-NORTH BARITO", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "BIG HUB SITE" },
+            { site_id: "12JKP0332", mc_cluster: "MC-JAKARTA PUSAT", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21KSN0077", mc_cluster: "MC-KATINGAN", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "20SAG0184", mc_cluster: "MC-SANGGAU", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "29SNS0177", mc_cluster: "MC-GOWA", circle: "KALISUMAPA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "20SAG0182", mc_cluster: "MC-SANGGAU", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "05LGA0032", mc_cluster: "MC-BINTAN", circle: "SUMATERA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "22TRG0296", mc_cluster: "MC-TENGGARONG", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "22TRG0295", mc_cluster: "MC-TENGGARONG", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "22PPU0056", mc_cluster: "MC-PENAJAM", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "20BEK0014", mc_cluster: "MC-BENGKAYANG", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "20BEK0076", mc_cluster: "MC-BENGKAYANG", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "20BEK0013", mc_cluster: "MC-BENGKAYANG", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "21MTW0032", mc_cluster: "MC-NORTH BARITO", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "20STA0067", mc_cluster: "MC-SINTANG", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "21PBU0010", mc_cluster: "MC-PANGKALANBUN", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "04TBH0067", mc_cluster: "MC-INDRAGIRI HILIR", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "22SAA0121", mc_cluster: "MC-SANGATA", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "27BKU0103", mc_cluster: "MC-MOROWALI", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "27BWA0005", mc_cluster: "MC-PALU OUTER", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "21KPA0009", mc_cluster: "MC-SERUYAN", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "21SPT0004", mc_cluster: "MC-PARENGGEAN", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "12JKS0505", mc_cluster: "MC-PASAR MINGGU", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKS0865", mc_cluster: "MC-PASAR MINGGU", circle: "JAYA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "02SDB0115", mc_cluster: "MC-TEBING TINGGI", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "23MRB0075", mc_cluster: "MC-BARITO KUALA", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "04PPN0019", mc_cluster: "MC-ROKAN HULU", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21MTW0023", mc_cluster: "MC-NORTH BARITO", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "BIG HUB SITE" },
+            { site_id: "02LBP0381", mc_cluster: "MC-DELI SERDANG RAYA", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKS0850", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "02SDB0148", mc_cluster: "MC-TEBING TINGGI", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "01KRB0038", mc_cluster: "MC-LANGSA", circle: "SUMATERA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "20SAG0034", mc_cluster: "MC-SANGGAU", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "08TIS0039", mc_cluster: "MC-BENGKULU", circle: "SUMATERA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "20PTK0011", mc_cluster: "MC-PONTIANAK", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "23KBA0068", mc_cluster: "MC-KOTABARU", circle: "KALISUMAPA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "11TGN0037", mc_cluster: "MC-BALARAJA", circle: "JAYA", duration_range: "m24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "29MLI0004", mc_cluster: "MC-EAST LUWU", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08BKL0079", mc_cluster: "MC-BENGKULU", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "04BKG0049", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKB0637", mc_cluster: "MC-CENGKARENG", circle: "JAYA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "01MAK0022", mc_cluster: "MC-ACEH BARAT", circle: "SUMATERA", duration_range: "m24",
+            hub_type: "END SITE" },
+            { site_id: "02SBH0035", mc_cluster: "MC-PALUTA", circle: "SUMATERA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "02SBH0034", mc_cluster: "MC-PALUTA", circle: "SUMATERA", duration_range: "m24", hub_type: "END SITE" },
+            { site_id: "20KTP0149", mc_cluster: "MC-MANIS MATA", circle: "KALISUMAPA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "02LBP0347", mc_cluster: "MC-DELI SERDANG RAYA", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "04UJT0032", mc_cluster: "MC-ROKAN HILIR", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07SKY0022", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08AGR0012", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "BIG HUB SITE" },
+            { site_id: "13CJR0225", mc_cluster: "MC-CIANJUR TENGAH", circle: "JAYA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "02SDB0099", mc_cluster: "MC-TEBING TINGGI", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08MKO0013", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "07BNS0030", mc_cluster: "MC-BANYUASIN BARAT", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13CBN0012", mc_cluster: "MC-PARUNG", circle: "JAYA", duration_range: "m24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0094", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "m24",
+                hub_type: "END SITE" },
+            { site_id: "12JKU0585", mc_cluster: "MC-KELAPA GADING", circle: "JAYA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "01BPD0006", mc_cluster: "MC-ACEH SELATAN", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "01TKN0035", mc_cluster: "MC-ACEH TENGAH", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "13KRW0013", mc_cluster: "MC-RENGASDENGKLOK", circle: "JAYA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "17DPS0041", mc_cluster: "MC-DENPASAR BARATA", circle: "JAVA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21SMA0017", mc_cluster: "MC-LAMANDAU", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "13CKR0587", mc_cluster: "MC-CIKARANG", circle: "JAYA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "13CBN0739", mc_cluster: "MC-CIJERUK", circle: "JAYA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "08BKL0064", mc_cluster: "MC-BENGKULU", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "03PPJ0048", mc_cluster: "MC-DHARMASRAYA", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "13CBN0719", mc_cluster: "MC-CIBINONG", circle: "JAYA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "11CRS0380", mc_cluster: "MC-SERANG BARAT", circle: "JAYA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "09KRI0031", mc_cluster: "MC-KRUI", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "04BKG0173", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "04BKG0177", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "08TIS0018", mc_cluster: "MC-BENGKULU", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LHT0010", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "16JMB0002", mc_cluster: "MC-JOMBANG SELATAN", circle: "JAVA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07PBM0043", mc_cluster: "MC-PRABUMULIH", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "04PPN0015", mc_cluster: "MC-ROKAN HULU", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21PBU0084", mc_cluster: "MC-PANGKALANBUN", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "22SDW0084", mc_cluster: "MC-MELAK", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "02MDN0262", mc_cluster: "MC-MEDAN MARITIM", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "21KPA0031", mc_cluster: "MC-SERUYAN", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "21KPA0041", mc_cluster: "MC-SERUYAN", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "10SLT0060", mc_cluster: "MC-BANGKA", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKP0202", mc_cluster: "MC-JAKARTA PUSAT", circle: "JAYA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "12JKS0443", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "12JKS0506", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "12JKS0501", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "12JKS0622", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "12JKS0626", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "12JKS0507", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "12JKS0600", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "12JKS0646", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKS0448", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKS0623", mc_cluster: "MC-PANCORAN", circle: "JAYA", duration_range: "8_24",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "20SAG0198", mc_cluster: "MC-SANGGAU", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "08AGR0080", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "02PYB0081", mc_cluster: "MC-MADINA", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "20KTP0175", mc_cluster: "MC-KETAPANG", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "06BKO0060", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "03PDN0082", mc_cluster: "MC-PADANG", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "32MBA0001", mc_cluster: "MC-HALMAHERA", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "02STB0163", mc_cluster: "MC-LANGKAT BARAT", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "20MPW0034", mc_cluster: "MC-MEMPAWAH", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07BNS0173", mc_cluster: "MC-BANYUASIN TIMUR", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "29RTP0048", mc_cluster: "MC-TORAJA", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "07BNS0162", mc_cluster: "MC-BANYUASIN TIMUR", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "02TUK0021", mc_cluster: "MC-NIAS", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "02TUK0014", mc_cluster: "MC-NIAS", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "02TUK0029", mc_cluster: "MC-NIAS", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "20SRY0079", mc_cluster: "MC-KUBU RAYA", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13CBN0768", mc_cluster: "MC-CIJERUK", circle: "JAYA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0016", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07OGS0057", mc_cluster: "MC-OKU INDUK", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "20NBA0055", mc_cluster: "MC-LANDAK", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "25MDO0178", mc_cluster: "MC-MANADO", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "02KPN0035", mc_cluster: "MC-LABUHAN BATU", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0057", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "08TIS0048", mc_cluster: "MC-BENGKULU", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13CBN0069", mc_cluster: "MC-PARUNG", circle: "JAYA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07OKI0084", mc_cluster: "MC-OKI", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07OGI0001", mc_cluster: "MC-OGAN ILIR", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "04TAK0044", mc_cluster: "MC-KUANTAN SINGINGI", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "20NBA0073", mc_cluster: "MC-LANDAK", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "02MDN0104", mc_cluster: "MC-MEDAN SELATAN", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07OKI0076", mc_cluster: "MC-OKI", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "20SKW0002", mc_cluster: "MC-SINGKAWANG", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07SKY0036", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "07OKI0082", mc_cluster: "MC-OKI", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "02SDB0067", mc_cluster: "MC-TEBING TINGGI", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07BNS0022", mc_cluster: "MC-BANYUASIN BARAT", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07BNS0042", mc_cluster: "MC-BANYUASIN BARAT", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "07OKI0097", mc_cluster: "MC-OKI", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07BNS0025", mc_cluster: "MC-BANYUASIN BARAT", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "25KTG0012", mc_cluster: "MC-BOLAANG MONGONDOW", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "07SKY0028", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "09BLU0043", mc_cluster: "MC-WAY KANAN", circle: "SUMATERA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "20STA0141", mc_cluster: "MC-SINTANG", circle: "KALISUMAPA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "20PTS0072", mc_cluster: "MC-PUTUSSIBAU", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "07LHT0053", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "29MAS0068", mc_cluster: "MC-NORTH LUWU", circle: "KALISUMAPA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13CBN0903", mc_cluster: "MC-GUNUNG PUTRI", circle: "JAYA", duration_range: "8_24",
+            hub_type: "END SITE" },
+            { site_id: "07SKY0033", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "09KLA0123", mc_cluster: "MC-LAMPUNG SELATAN", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "07MEN0099", mc_cluster: "MC-MUARA ENIM", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "02DLS0015", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "04BLS0008", mc_cluster: "MC-DUMAI", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "02KGS0010", mc_cluster: "MC-NIAS", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "07OGI0041", mc_cluster: "MC-OGAN ILIR", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "04UJT0014", mc_cluster: "MC-ROKAN HILIR", circle: "SUMATERA", duration_range: "8_24",
+                hub_type: "END SITE" },
+            { site_id: "07LHT0033", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "8_24", hub_type: "END SITE" },
+            { site_id: "07LLG0082", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LHT0038", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21PBU0020", mc_cluster: "MC-PANGKALANBUN", circle: "KALISUMAPA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LHT0022", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "02PMS0017", mc_cluster: "MC-SIANTAR", circle: "SUMATERA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "07LHT0014", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "07LHT0020", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "09KRI0044", mc_cluster: "MC-KRUI", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "08AGR0044", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0105", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0037", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "16LMJ0027", mc_cluster: "MC-LUMAJANG", circle: "JAVA", duration_range: "4_8",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0044", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "20SAG0214", mc_cluster: "MC-SANGGAU", circle: "KALISUMAPA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "04BKG0125", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08AGR0051", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "03LBU0106", mc_cluster: "MC-BUKITTINGGI", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0088", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07SKY0038", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07SKY0044", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0077", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0051", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "07LLG0041", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "09LPU0156", mc_cluster: "MC-LAMPUNG UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "19MLK0027", mc_cluster: "MC-BELU MALAKA", circle: "JAVA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "09LPU0111", mc_cluster: "MC-LAMPUNG UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "09LPU0012", mc_cluster: "MC-LAMPUNG UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0047", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "BIG HUB SITE" },
+            { site_id: "07LLG0068", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0086", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LHT0068", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "13CKR0058", mc_cluster: "MC-TAMBUN", circle: "JAYA", duration_range: "4_8",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0106", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "08AGR0022", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0004", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08AGR0076", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "04BKG0002", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07OKI0153", mc_cluster: "MC-OKI", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "07RPT0020", mc_cluster: "MC-MUSI RAWAS UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "04BKG0122", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "07LLG0064", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "08BIN0005", mc_cluster: "MC-MANNA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "07LLG0076", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "22SAA0077", mc_cluster: "MC-SANGATA", circle: "KALISUMAPA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "07LLU0002", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0008", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0046", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0075", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LHT0064", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "07LHT0057", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0024", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0052", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0062", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0015", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21NIK0055", mc_cluster: "MC-LAMANDAU", circle: "KALISUMAPA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "07LLG0069", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0042", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "16GSK0244", mc_cluster: "MC-GRESIK_UTARA", circle: "JAVA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0101", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0066", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07RPT0027", mc_cluster: "MC-MUSI RAWAS UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0080", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "08LBN0008", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "07LLG0081", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "11TGN0559", mc_cluster: "MC-SEPATAN", circle: "JAYA", duration_range: "4_8",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGN0614", mc_cluster: "MC-SEPATAN", circle: "JAYA", duration_range: "4_8",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0050", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "06BKO0049", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "07LLG0093", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "22SMR0150", mc_cluster: "MC-SAMARINDA", circle: "KALISUMAPA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07MEN0142", mc_cluster: "MC-MUARA ENIM", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "08TIS0020", mc_cluster: "MC-BENGKULU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGX0131", mc_cluster: "MC-SERPONG", circle: "JAYA", duration_range: "4_8",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGX0157", mc_cluster: "MC-SERPONG", circle: "JAYA", duration_range: "4_8",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0049", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGR0326", mc_cluster: "MC-CIPONDOH", circle: "JAYA", duration_range: "4_8",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGR0310", mc_cluster: "MC-CIPONDOH", circle: "JAYA", duration_range: "4_8",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "08MKO0044", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0108", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "08MKO0046", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07OGS0008", mc_cluster: "MC-OKU INDUK", circle: "SUMATERA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "07LLG0099", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0084", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0083", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07BNS0226", mc_cluster: "MC-BANYUASIN TIMUR", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0070", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07BNS0189", mc_cluster: "MC-BANYUASIN TIMUR", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "01JHO0122", mc_cluster: "MC-BANDA ACEH", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0033", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07SKY0037", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07LLG0095", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0021", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07OKI0081", mc_cluster: "MC-OKI", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "07LLG0039", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07OGI0023", mc_cluster: "MC-OGAN ILIR", circle: "SUMATERA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "20BEK0027", mc_cluster: "MC-BENGKAYANG", circle: "KALISUMAPA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "20BEK0025", mc_cluster: "MC-BENGKAYANG", circle: "KALISUMAPA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "20BEK0026", mc_cluster: "MC-BENGKAYANG", circle: "KALISUMAPA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LHT0086", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "06JBI0061", mc_cluster: "MC-JAMBI", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "33BIA0010", mc_cluster: "MC-BIAK", circle: "KALISUMAPA", duration_range: "4_8",
+            hub_type: "END SITE" },
+            { site_id: "06BKO0007", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07OKI0186", mc_cluster: "MC-OKI", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "04PBR0130", mc_cluster: "MC-NORTH PEKANBARU", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07OGS0051", mc_cluster: "MC-OKU INDUK", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LHT0097", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "07LHT0075", mc_cluster: "MC-LAHAT", circle: "SUMATERA", duration_range: "4_8", hub_type: "END SITE" },
+            { site_id: "06MBN0053", mc_cluster: "MC-JAMBI TIMUR", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "07RPT0030", mc_cluster: "MC-MUSI RAWAS UTARA", circle: "SUMATERA", duration_range: "4_8",
+                hub_type: "END SITE" },
+            { site_id: "08CRP0063", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4", hub_type: "END SITE" },
+            { site_id: "08AGR0037", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "07SKY0041", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0057", mc_cluster: "MC-MUSI RAWAS UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "02LBP0123", mc_cluster: "MC-DELI SERDANG SELATAN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0025", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "09KRI0030", mc_cluster: "MC-KRUI", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0042", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "11PDG0102", mc_cluster: "MC-PANDEGLANG SELATAN", circle: "JAYA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "08MKO0002", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0028", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0003", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0059", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "06BKO0045", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "09MGA0063", mc_cluster: "MC-TULANG BAWANG", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "06BKO0015", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "04UJT0070", mc_cluster: "MC-ROKAN HILIR", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "06BKO0058", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "25KTG0080", mc_cluster: "MC-BOLAANG MONGONDOW", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "06BKO0053", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21MTW0041", mc_cluster: "MC-NORTH BARITO", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "11TGR0116", mc_cluster: "MC-CIPONDOH", circle: "JAYA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0098", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "07SKY0152", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "07SKY0050", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "11PDG0075", mc_cluster: "MC-PANDEGLANG SELATAN", circle: "JAYA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "07SKY0065", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08MKO0055", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "22SDW0022", mc_cluster: "MC-MELAK", circle: "KALISUMAPA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "06BKO0030", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07SKY0067", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "08AGR0073", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0024", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "07LLG0065", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07SKY0145", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07BNS0207", mc_cluster: "MC-BANYUASIN TIMUR", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "04SSI0069", mc_cluster: "MC-SIAK", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "02LBP0345", mc_cluster: "MC-DELI SERDANG RAYA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07LLG0016", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "07SKY0045", mc_cluster: "MC-SUNGAI LILIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "02LBP0267", mc_cluster: "MC-DELI SERDANG UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "22BPP0087", mc_cluster: "MC-BALIKPAPAN", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "02SDB0101", mc_cluster: "MC-TEBING TINGGI", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06SGE0010", mc_cluster: "MC-JAMBI TIMUR", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "06BKO0026", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "04BKG0069", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "20MPW0037", mc_cluster: "MC-MEMPAWAH", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGR0048", mc_cluster: "MC-KARAWACI", circle: "JAYA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGR0018", mc_cluster: "MC-KARAWACI", circle: "JAYA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGN0442", mc_cluster: "MC-PAGEDANGAN", circle: "JAYA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13SUB0077", mc_cluster: "MC-SUBANG SELATAN", circle: "JAYA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21BNT0021", mc_cluster: "MC-SOUTH BARITO", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "02DLS0013", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "02DLS0028", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "16MJK0169", mc_cluster: "MC-MOJOKERTO SELATAN", circle: "JAVA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "11TGR0113", mc_cluster: "MC-CIPONDOH", circle: "JAYA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "02DLS0014", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "11TGN0031", mc_cluster: "MC-BALARAJA", circle: "JAYA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0032", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "21KKP0103", mc_cluster: "MC-KAPUAS", circle: "KALISUMAPA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "06BKO0029", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "03LBS0023", mc_cluster: "MC-BUKITTINGGI", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08MKO0056", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "25MDO0037", mc_cluster: "MC-MANADO", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "01JHO0135", mc_cluster: "MC-BANDA ACEH", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "01JHO0120", mc_cluster: "MC-BANDA ACEH", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "24TSL0013", mc_cluster: "MC-BULUNGAN", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "28TDK0037", mc_cluster: "MC-PASANGKAYU", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "23PLI0080", mc_cluster: "MC-PELAIHARI", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "29MAS0026", mc_cluster: "MC-NORTH LUWU", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "29MAS0028", mc_cluster: "MC-NORTH LUWU", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "29MAS0030", mc_cluster: "MC-NORTH LUWU", circle: "KALISUMAPA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "04PPN0031", mc_cluster: "MC-ROKAN HULU", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "12JKB0391", mc_cluster: "MC-GROGOL", circle: "JAYA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "04PKR0051", mc_cluster: "MC-PELALAWAN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "20KTP0174", mc_cluster: "", circle: "KALISUMAPA", duration_range: "1_4", hub_type: "END SITE" },
+            { site_id: "04BKG0061", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "08CRP0061", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4", hub_type: "END SITE" },
+            { site_id: "07LLG0096", mc_cluster: "MC-LUBUKLINGGAU", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "08CRP0054", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4", hub_type: "END SITE" },
+            { site_id: "08CRP0055", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4", hub_type: "END SITE" },
+            { site_id: "04PBR0336", mc_cluster: "MC-SOUTH PEKANBARU", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0021", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "11TGR0125", mc_cluster: "MC-CIPONDOH", circle: "JAYA", duration_range: "1_4",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "04TBH0042", mc_cluster: "MC-INDRAGIRI HILIR", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "06BKO0033", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "04PBR0248", mc_cluster: "MC-SOUTH PEKANBARU", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "01JHO0126", mc_cluster: "MC-BANDA ACEH", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06BKO0051", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "06BKO0022", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08MKO0032", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "02SBH0028", mc_cluster: "MC-PALUTA", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "07LLG0056", mc_cluster: "MC-MUSI RAWAS UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "06BKO0050", mc_cluster: "MC-MERANGIN", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "01SGI0039", mc_cluster: "MC-PIDIE JAYA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08MKO0001", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "01TTN0061", mc_cluster: "MC-ACEH SELATAN", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "08CRP0011", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08CRP0049", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "13GRT0029", mc_cluster: "MC-GARUT TENGAH", circle: "JAYA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08CRP0050", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "08KPH0024", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "06SPN0039", mc_cluster: "MC-KERINCI", circle: "SUMATERA", duration_range: "1_4",
+            hub_type: "END SITE" },
+            { site_id: "08CRP0025", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "01JHO0125", mc_cluster: "MC-BANDA ACEH", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "01SGI0094", mc_cluster: "MC-PIDIE JAYA", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "END SITE" },
+            { site_id: "08KPH0029", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1_4",
+                hub_type: "SMALL HUB SITE" },
+            { site_id: "27BKU0111", mc_cluster: "MC-MOROWALI", circle: "KALISUMAPA", duration_range: "1",
+            hub_type: "END SITE" },
+            { site_id: "01LNS0013", mc_cluster: "MC-LANGSA", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "13CBN0137", mc_cluster: "MC-PARUNG", circle: "JAYA", duration_range: "1", hub_type: "SMALL HUB SITE" },
+            { site_id: "13CBN0151", mc_cluster: "MC-PARUNG", circle: "JAYA", duration_range: "1", hub_type: "SMALL HUB SITE" },
+            { site_id: "04BKG0196", mc_cluster: "MC-KAMPAR", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "14WNO0037", mc_cluster: "MC-WONOSOBO", circle: "JAVA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "14WNO0109", mc_cluster: "MC-WONOSOBO", circle: "JAVA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "06MAB0049", mc_cluster: "MC-BUNGO", circle: "SUMATERA", duration_range: "1",
+            hub_type: "SMALL HUB SITE" },
+        ];
 
-    function toggleSubmenu() {
-        document.getElementById('submenu').classList.toggle('open');
-    }
+        // Add more entries that were truncated - these are key ones from the remaining data
+        const MORE_DATA = [
+            { site_id: "02SMS0027", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02DLS0023", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1",
+                hub_type: "MEDIUM HUB SITE" },
+            { site_id: "02DLS0017", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "02SMS0015", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02TRT0059", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0014", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0029", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0030", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0031", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0034", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0039", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0042", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0050", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0045", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0046", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02DLS0030", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "02SMS0026", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "02SMS0038", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "08KPH0026", mc_cluster: "MC-CURUP", circle: "SUMATERA", duration_range: "1",
+            hub_type: "SMALL HUB SITE" },
+            { site_id: "02DLS0019", mc_cluster: "MC-TAPUT", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "09WMY0058", mc_cluster: "MC-MESUJI", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "22SMR0168", mc_cluster: "MC-SAMARINDA", circle: "KALISUMAPA", duration_range: "1",
+            hub_type: "END SITE" },
+            { site_id: "22SMR0190", mc_cluster: "MC-SAMARINDA", circle: "KALISUMAPA", duration_range: "1",
+            hub_type: "END SITE" },
+            { site_id: "01KRB0053", mc_cluster: "MC-LANGSA", circle: "SUMATERA", duration_range: "1", hub_type: "END SITE" },
+            { site_id: "08MKO0034", mc_cluster: "MC-BENGKULU UTARA", circle: "SUMATERA", duration_range: "1",
+                hub_type: "END SITE" },
+            { site_id: "06SRJ0006", mc_cluster: "MC-SAROLANGUN", circle: "SUMATERA", duration_range: "1",
+            hub_type: "END SITE" },
+        ];
 
-    function updateClock() {
-        const now = new Date();
-        document.getElementById('clock').textContent = now.toLocaleTimeString('en-ID', {timeZone:'Asia/Jakarta', hour:'2-digit', minute:'2-digit', second:'2-digit'}) + ' WIB';
-    }
-    setInterval(updateClock, 1000); updateClock();
+        // Combine all data
+        const allData = [...RAW_DATA, ...MORE_DATA];
 
-    async function fetchWeather() {
-        try {
-            const res = await fetch('https://api.open-meteo.com/v1/forecast?latitude=-6.2088&longitude=106.8456&current_weather=true&timezone=Asia/Jakarta');
-            const data = await res.json();
-            if (data.current_weather) {
-                const w = data.current_weather;
-                const emoji = {0:'☀️',1:'🌤️',2:'⛅',3:'☁️',45:'🌫️',51:'🌦️',61:'🌧️',80:'⛈️'}[w.weathercode] || '🌡️';
-                document.getElementById('weather').innerHTML = `${emoji} ${w.temperature}°C Jakarta`;
+        // Clean: filter out rows with empty mc_cluster for pivot (or keep as "Unknown")
+        const processedData = allData.map(d => ({
+            ...d,
+            mc_cluster: d.mc_cluster && d.mc_cluster.trim() ? d.mc_cluster.trim() : "UNKNOWN_CLUSTER",
+            circle: d.circle && d.circle.trim() ? d.circle.trim() : "UNKNOWN_CIRCLE",
+        }));
+
+        // ============ STATE ============
+        let activeTab = 'overview';
+        let charts = {}; // Store chart instances for cleanup
+
+        // ============ COMPUTED DATA ============
+        function getCircleCounts() {
+            const map = {};
+            processedData.forEach(d => {
+                map[d.circle] = (map[d.circle] || 0) + 1;
+            });
+            return Object.entries(map).sort((a, b) => b[1] - a[1]);
+        }
+
+        function getClusterCounts() {
+            const map = {};
+            processedData.forEach(d => {
+                map[d.mc_cluster] = (map[d.mc_cluster] || 0) + 1;
+            });
+            return Object.entries(map).sort((a, b) => b[1] - a[1]);
+        }
+
+        function getPivotData() {
+            const circles = [...new Set(processedData.map(d => d.circle))].sort();
+            const clusters = [...new Set(processedData.map(d => d.mc_cluster))].sort();
+            const pivot = {};
+            circles.forEach(c => {
+                pivot[c] = {};
+                clusters.forEach(cl => { pivot[c][cl] = 0; });
+            });
+            processedData.forEach(d => {
+                pivot[d.circle][d.mc_cluster] = (pivot[d.circle][d.mc_cluster] || 0) + 1;
+            });
+            return { circles, clusters, pivot };
+        }
+
+        // ============ DESTROY CHARTS ============
+        function destroyChart(key) {
+            if (charts[key]) {
+                charts[key].destroy();
+                delete charts[key];
             }
-        } catch(e) {}
-    }
-    fetchWeather(); setInterval(fetchWeather, 600000);
-</script>
+        }
+
+        function destroyAllCharts() {
+            Object.keys(charts).forEach(k => destroyChart(k));
+        }
+
+        // ============ COLORS ============
+        const colorPalette = [
+            '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316',
+            '#6366f1', '#14b8a6', '#e11d48', '#0ea5e9', '#84cc16', '#a855f7', '#d946ef', '#64748b',
+            '#22d3ee', '#fb923c', '#4f46e5', '#059669', '#dc2626', '#7c3aed', '#0891b2', '#ea580c',
+            '#2563eb', '#c026d3', '#65a30d', '#eab308', '#9333ea', '#0284c7',
+        ];
+
+        function getColor(i) {
+            return colorPalette[i % colorPalette.length];
+        }
+
+        // ============ RENDER OVERVIEW CHARTS ============
+        function renderOverviewCharts() {
+            destroyChart('circleBar');
+            destroyChart('clusterBar');
+            destroyChart('circlePie');
+            destroyChart('clusterPie');
+
+            const circleCounts = getCircleCounts();
+            const clusterCounts = getClusterCounts();
+
+            const topCircleLimit = parseInt(document.getElementById('topCircleLimit').value) || circleCounts.length;
+            const topClusterLimit = parseInt(document.getElementById('topClusterLimit').value) || clusterCounts
+        .length;
+
+            const topCircles = topCircleLimit > 0 ? circleCounts.slice(0, topCircleLimit) : circleCounts;
+            const topClusters = topClusterLimit > 0 ? clusterCounts.slice(0, topClusterLimit) : clusterCounts;
+
+            // Circle Bar Chart
+            const ctxCB = document.getElementById('chartCircleBar').getContext('2d');
+            charts['circleBar'] = new Chart(ctxCB, {
+                type: 'bar',
+                data: {
+                    labels: topCircles.map(c => c[0]),
+                    datasets: [{
+                        label: 'Site Count',
+                        data: topCircles.map(c => c[1]),
+                        backgroundColor: topCircles.map((_, i) => getColor(i)),
+                        borderRadius: 6,
+                        borderSkipped: false,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    indexAxis: 'y',
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { callbacks: { label: ctx => ` ${ctx.raw} sites` } }
+                    },
+                    scales: {
+                        x: { title: { display: true, text: 'Number of Sites', font: { weight: 'bold' } },
+                            beginAtZero: true, ticks: { stepSize: 1 } },
+                        y: { ticks: { font: { size: 10 } } }
+                    }
+                }
+            });
+
+            // Cluster Bar Chart
+            const ctxCL = document.getElementById('chartClusterBar').getContext('2d');
+            charts['clusterBar'] = new Chart(ctxCL, {
+                type: 'bar',
+                data: {
+                    labels: topClusters.map(c => c[0]),
+                    datasets: [{
+                        label: 'Site Count',
+                        data: topClusters.map(c => c[1]),
+                        backgroundColor: topClusters.map((_, i) => getColor(i + 5)),
+                        borderRadius: 6,
+                        borderSkipped: false,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    indexAxis: 'y',
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { callbacks: { label: ctx => ` ${ctx.raw} sites` } }
+                    },
+                    scales: {
+                        x: { title: { display: true, text: 'Number of Sites', font: { weight: 'bold' } },
+                            beginAtZero: true, ticks: { stepSize: 1 } },
+                        y: { ticks: { font: { size: 10 } } }
+                    }
+                }
+            });
+
+            // Circle Pie
+            const pieCircleData = circleCounts.slice(0, 12);
+            const otherCircleSum = circleCounts.slice(12).reduce((s, c) => s + c[1], 0);
+            const pieCircleLabels = pieCircleData.map(c => c[0]);
+            const pieCircleValues = pieCircleData.map(c => c[1]);
+            if (otherCircleSum > 0) { pieCircleLabels.push('Others');
+                pieCircleValues.push(otherCircleSum); }
+
+            const ctxCP = document.getElementById('chartCirclePie').getContext('2d');
+            charts['circlePie'] = new Chart(ctxCP, {
+                type: 'doughnut',
+                data: {
+                    labels: pieCircleLabels,
+                    datasets: [{
+                        data: pieCircleValues,
+                        backgroundColor: pieCircleLabels.map((_, i) => getColor(i)),
+                        borderWidth: 2,
+                        borderColor: '#fff',
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'right', labels: { padding: 12, font: { size: 10 },
+                                usePointStyle: true } },
+                        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${ctx.raw} sites (${((ctx.raw /
+                                    processedData.length) * 100).toFixed(1)}%)` } }
+                    }
+                }
+            });
+
+            // Cluster Pie
+            const pieClusterData = clusterCounts.slice(0, 12);
+            const otherClusterSum = clusterCounts.slice(12).reduce((s, c) => s + c[1], 0);
+            const pieClusterLabels = pieClusterData.map(c => c[0]);
+            const pieClusterValues = pieClusterData.map(c => c[1]);
+            if (otherClusterSum > 0) { pieClusterLabels.push('Others');
+                pieClusterValues.push(otherClusterSum); }
+
+            const ctxCLP = document.getElementById('chartClusterPie').getContext('2d');
+            charts['clusterPie'] = new Chart(ctxCLP, {
+                type: 'doughnut',
+                data: {
+                    labels: pieClusterLabels,
+                    datasets: [{
+                        data: pieClusterValues,
+                        backgroundColor: pieClusterLabels.map((_, i) => getColor(i + 3)),
+                        borderWidth: 2,
+                        borderColor: '#fff',
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'right', labels: { padding: 12, font: { size: 10 },
+                                usePointStyle: true } },
+                        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${ctx.raw} sites (${((ctx.raw /
+                                    processedData.length) * 100).toFixed(1)}%)` } }
+                    }
+                }
+            });
+        }
+
+        // ============ RENDER PIVOT TABLE ============
+        function renderPivotTable() {
+            const { circles, clusters, pivot } = getPivotData();
+            const circleFilter = document.getElementById('pivotCircleFilter').value;
+            const clusterFilter = document.getElementById('pivotClusterFilter').value;
+
+            let filteredCircles = circleFilter ? circles.filter(c => c === circleFilter) : circles;
+            let filteredClusters = clusterFilter ? clusters.filter(c => c === clusterFilter) : clusters;
+
+            // Limit for display
+            const displayClusters = filteredClusters.slice(0, 30);
+            const displayCircles = filteredCircles.slice(0, 30);
+
+            let html = '<table><thead><tr><th>Circle ↓ / MC Cluster →</th>';
+            displayClusters.forEach(cl => {
+                html +=
+                    `<th title="${cl}">${cl.length > 18 ? cl.substring(0, 16) + '...' : cl}</th>`;
+            });
+            html += '<th style="background:#fef3c7;">TOTAL</th></tr></thead><tbody>';
+
+            displayCircles.forEach(c => {
+                html += '<tr>';
+                html +=
+                    `<td style="font-weight:700;background:#f8fafc;position:sticky;left:0;z-index:2;">${c}</td>`;
+                let rowSum = 0;
+                displayClusters.forEach(cl => {
+                    const val = pivot[c][cl] || 0;
+                    rowSum += val;
+                    const badgeClass = val > 5 ? 'high' : val > 2 ? 'medium' : '';
+                    html +=
+                        `<td class="highlight-cell"><span class="count-badge ${badgeClass}">${val || '-'}</span></td>`;
+                });
+                html +=
+                    `<td style="font-weight:800;background:#fef3c7;text-align:center;font-size:0.9rem;">${rowSum}</td>`;
+                html += '</tr>';
+            });
+
+            // Totals row
+            html += '<tr style="background:#e8f0fe;font-weight:800;">';
+            html += '<td style="position:sticky;left:0;background:#dbeafe;z-index:2;">TOTAL</td>';
+            let grandTotal = 0;
+            displayClusters.forEach(cl => {
+                let colSum = 0;
+                displayCircles.forEach(c => { colSum += (pivot[c][cl] || 0); });
+                grandTotal += colSum;
+                html += `<td style="text-align:center;">${colSum}</td>`;
+            });
+            html += `<td style="background:#fef3c7;text-align:center;font-size:0.95rem;">${grandTotal}</td>`;
+            html += '</tr></tbody></table>';
+
+            if (filteredClusters.length > 30 || filteredCircles.length > 30) {
+                html +=
+                    `<p style="padding:10px;color:#6b7280;font-size:0.8rem;">⚠️ Showing limited view. Use filters above or scroll. Total circles: ${filteredCircles.length}, Total clusters: ${filteredClusters.length}</p>`;
+            }
+
+            document.getElementById('pivotTableWrapper').innerHTML = html;
+        }
+
+        // ============ RENDER HEATMAP ============
+        function renderHeatmapChart() {
+            destroyChart('heatmap');
+            const { circles, clusters, pivot } = getPivotData();
+            const circleCounts = getCircleCounts();
+            const clusterCounts = getClusterCounts();
+
+            const topCircles = circleCounts.slice(0, 20).map(c => c[0]);
+            const topClusters = clusterCounts.slice(0, 15).map(c => c[0]);
+
+            const labels = topClusters;
+            const datasets = topCircles.map((circle, i) => ({
+                label: circle,
+                data: topClusters.map(cl => pivot[circle][cl] || 0),
+                backgroundColor: getColor(i),
+                borderColor: '#fff',
+                borderWidth: 1,
+            }));
+
+            const ctx = document.getElementById('chartHeatmap').getContext('2d');
+            charts['heatmap'] = new Chart(ctx, {
+                type: 'bar',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'bottom', labels: { font: { size: 9 }, usePointStyle: true,
+                                padding: 8 } },
+                        tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.raw} sites` } }
+                    },
+                    scales: {
+                        x: { stacked: true, ticks: { font: { size: 8 }, maxRotation: 60 },
+                            title: { display: true, text: 'MC Cluster', font: { weight: 'bold' } } },
+                        y: { stacked: true, title: { display: true, text: 'Site Count', font: { weight: 'bold' } },
+                            ticks: { stepSize: 1 } }
+                    }
+                }
+            });
+        }
+
+        // ============ RENDER DETAIL TABLE ============
+        function renderDetailTable() {
+            const searchTerm = (document.getElementById('detailSearch').value || '').toLowerCase();
+            const { circles, clusters, pivot } = getPivotData();
+
+            let rows = [];
+            circles.forEach(c => {
+                clusters.forEach(cl => {
+                    const val = pivot[c][cl] || 0;
+                    if (val > 0) {
+                        rows.push({ circle: c, mc_cluster: cl, count: val });
+                    }
+                });
+            });
+
+            if (searchTerm) {
+                rows = rows.filter(r =>
+                    r.circle.toLowerCase().includes(searchTerm) ||
+                    r.mc_cluster.toLowerCase().includes(searchTerm)
+                );
+            }
+
+            rows.sort((a, b) => b.count - a.count);
+
+            let html =
+                '<table><thead><tr><th>#</th><th>Circle</th><th>MC Cluster</th><th>Site Count</th></tr></thead><tbody>';
+            rows.forEach((r, i) => {
+                const badgeClass = r.count > 5 ? 'high' : r.count > 2 ? 'medium' : '';
+                html +=
+                    `<tr><td>${i+1}</td><td style="font-weight:600;">${r.circle}</td><td>${r.mc_cluster}</td><td class="highlight-cell"><span class="count-badge ${badgeClass}">${r.count}</span></td></tr>`;
+            });
+            html += '</tbody></table>';
+
+            if (rows.length === 0) {
+                html = '<div class="empty-state"><div class="icon">🔍</div><p>No results found matching your search.</p></div>';
+            }
+
+            document.getElementById('detailTableWrapper').innerHTML = html;
+        }
+
+        // ============ POPULATE FILTERS ============
+        function populateFilters() {
+            const { circles, clusters } = getPivotData();
+            const circleFilter = document.getElementById('pivotCircleFilter');
+            const clusterFilter = document.getElementById('pivotClusterFilter');
+
+            circleFilter.innerHTML = '<option value="">All Circles</option>';
+            circles.forEach(c => {
+                circleFilter.innerHTML += `<option value="${c}">${c}</option>`;
+            });
+
+            clusterFilter.innerHTML = '<option value="">All MC Clusters</option>';
+            clusters.forEach(c => {
+                clusterFilter.innerHTML += `<option value="${c}">${c}</option>`;
+            });
+        }
+
+        // ============ UPDATE STATS ============
+        function updateStats() {
+            const circleCounts = getCircleCounts();
+            const clusterCounts = getClusterCounts();
+            const above24 = processedData.filter(d => d.duration_range === 'm24').length;
+
+            document.getElementById('statTotalSites').textContent = processedData.length;
+            document.getElementById('statCircles').textContent = circleCounts.length;
+            document.getElementById('statClusters').textContent = clusterCounts.length;
+            document.getElementById('statAbove24').textContent = above24;
+            document.getElementById('dataTimestamp').textContent = 'Last updated: ' + new Date().toLocaleString();
+        }
+
+        // ============ RENDER ALL ============
+        function renderAll() {
+            updateStats();
+            if (activeTab === 'overview') {
+                renderOverviewCharts();
+            } else if (activeTab === 'pivot') {
+                renderPivotTable();
+                renderHeatmapChart();
+            } else if (activeTab === 'detail') {
+                renderDetailTable();
+            }
+        }
+
+        // ============ TAB SWITCHING ============
+        function switchTab(tabName) {
+            activeTab = tabName;
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelector(`[data-tab="${tabName}"]`)?.classList.add('active');
+            document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+            const tabEl = document.getElementById(`tab-${tabName}`);
+            if (tabEl) tabEl.style.display = 'block';
+            destroyAllCharts();
+            renderAll();
+        }
+
+        // ============ EVENT LISTENERS ============
+        document.getElementById('tabButtons').addEventListener('click', function(e) {
+            if (e.target.classList.contains('tab-btn')) {
+                const tab = e.target.getAttribute('data-tab');
+                if (tab) switchTab(tab);
+            }
+        });
+
+        document.getElementById('pivotCircleFilter').addEventListener('change', renderPivotTable);
+        document.getElementById('pivotClusterFilter').addEventListener('change', renderPivotTable);
+
+        // File upload handling
+        document.getElementById('fileUpload').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(ev) {
+                try {
+                    const wb = XLSX.read(ev.target.result, { type: 'array' });
+                    const ws = wb.Sheets[wb.SheetNames[0]];
+                    const jsonData = XLSX.utils.sheet_to_json(ws, { header: 1 });
+                    if (jsonData.length < 2) {
+                        alert('File appears empty or invalid.');
+                        return;
+                    }
+                    const headers = jsonData[0];
+                    const siteIdIdx = headers.findIndex(h => h && String(h).toLowerCase().includes('site_id'));
+                    const mcClusterIdx = headers.findIndex(h => h && String(h).toLowerCase().includes('mc_cluster'));
+                    const circleIdx = headers.findIndex(h => h && String(h).toLowerCase().includes('circle'));
+
+                    if (siteIdIdx < 0 || mcClusterIdx < 0 || circleIdx < 0) {
+                        alert(
+                            'Could not find required columns: site_id, mc_cluster, circle. Please ensure the Excel has these columns.'
+                            );
+                        return;
+                    }
+
+                    const newData = [];
+                    for (let i = 1; i < jsonData.length; i++) {
+                        const row = jsonData[i];
+                        if (row && row[siteIdIdx]) {
+                            newData.push({
+                                site_id: String(row[siteIdIdx] || '').trim(),
+                                mc_cluster: String(row[mcClusterIdx] || '').trim() || 'UNKNOWN_CLUSTER',
+                                circle: String(row[circleIdx] || '').trim() || 'UNKNOWN_CIRCLE',
+                                duration_range: 'm24',
+                                hub_type: '',
+                            });
+                        }
+                    }
+
+                    if (newData.length === 0) {
+                        alert('No valid data rows found.');
+                        return;
+                    }
+
+                    // Replace data
+                    processedData.length = 0;
+                    processedData.push(...newData);
+                    destroyAllCharts();
+                    populateFilters();
+                    renderAll();
+                    alert(`✅ Successfully loaded ${newData.length} records from "${file.name}"`);
+                } catch (err) {
+                    alert('Error reading file: ' + err.message);
+                    console.error(err);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        // ============ EXPORT CSV ============
+        function exportPivotCSV() {
+            const { circles, clusters, pivot } = getPivotData();
+            let csv = 'Circle/MC Cluster,' + clusters.map(c => `"${c}"`).join(',') + ',TOTAL\n';
+            circles.forEach(c => {
+                let rowSum = 0;
+                const vals = clusters.map(cl => { const v = pivot[c][cl] || 0;
+                    rowSum += v; return v; });
+                csv += `"${c}",` + vals.join(',') + ',' + rowSum + '\n';
+            });
+            csv += 'TOTAL,';
+            clusters.forEach(cl => {
+                let colSum = 0;
+                circles.forEach(c => { colSum += (pivot[c][cl] || 0); });
+                csv += colSum + ',';
+            });
+            csv += processedData.length + '\n';
+
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'NE_SiteDown_Pivot_' + new Date().toISOString().slice(0, 10) + '.csv';
+            link.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function resetToDefault() {
+            destroyAllCharts();
+            processedData.length = 0;
+            processedData.push(...allData.map(d => ({
+                ...d,
+                mc_cluster: d.mc_cluster && d.mc_cluster.trim() ? d.mc_cluster.trim() : "UNKNOWN_CLUSTER",
+                circle: d.circle && d.circle.trim() ? d.circle.trim() : "UNKNOWN_CIRCLE",
+            })));
+            populateFilters();
+            document.getElementById('detailSearch').value = '';
+            document.getElementById('pivotCircleFilter').value = '';
+            document.getElementById('pivotClusterFilter').value = '';
+            document.getElementById('topCircleLimit').value = '15';
+            document.getElementById('topClusterLimit').value = '15';
+            renderAll();
+            alert('✅ Data reset to default embedded dataset.');
+        }
+
+        // ============ INITIALIZATION ============
+        function init() {
+            populateFilters();
+            switchTab('overview');
+        }
+
+        document.addEventListener('DOMContentLoaded', init);
+
+        // Handle window resize for charts
+        let resizeTimeout;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(() => {
+                if (activeTab === 'overview') renderOverviewCharts();
+                if (activeTab === 'pivot') renderHeatmapChart();
+            }, 300);
+        });
+    </script>
 </body>
 </html>
-<?php
-// ========== DEFINISI HALAMAN ==========
-function include_page_home() {
-    $db = getDB();
-    $totalSites = count(loadCmdb());
-    $totalUsers = $db->query("SELECT count(*) FROM users")->fetchColumn();
-    $pending = $db->query("SELECT count(*) FROM users WHERE status='pending'")->fetchColumn();
-    echo "<h2>📊 Dashboard Overview</h2>";
-    echo "<div style='display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:16px;'>";
-    echo "<div class='card' style='text-align:center;'><h3>".number_format($totalSites)."</h3><p>Total Sites</p></div>";
-    echo "<div class='card' style='text-align:center;'><h3>{$totalUsers}</h3><p>Users</p></div>";
-    echo "<div class='card' style='text-align:center;'><h3>{$pending}</h3><p>Pending Approval</p></div>";
-    echo "</div>";
-    echo "<div class='card'><h3>Quick Actions</h3><a href='?page=main_tools' class='btn'>Upload CMDB</a> <a href='?page=tools_mapping' class='btn'>Mapping</a></div>";
-}
-
-function include_page_admin_users() {
-    $db = getDB();
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['approve'])) {
-        $db->prepare("UPDATE users SET status='approved', approved_by=? WHERE id=?")->execute([$_SESSION['username'], (int)$_POST['id']]);
-        echo '<div class="alert alert-success">User approved.</div>';
-    } elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reject'])) {
-        $db->prepare("DELETE FROM users WHERE id=? AND role!='admin'")->execute([(int)$_POST['id']]);
-        echo '<div class="alert alert-error">User rejected.</div>';
-    }
-    $users = $db->query("SELECT * FROM users ORDER BY created_at DESC")->fetchAll();
-    echo "<h2>👥 User Approval</h2><table>";
-    echo "<tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Status</th><th>Action</th></tr>";
-    foreach ($users as $u) {
-        echo "<tr><td>".h($u['username'])."</td><td>".h($u['full_name'])."</td><td>".h($u['email'])."</td><td>{$u['role']}</td><td>{$u['status']}</td><td>";
-        if ($u['status'] === 'pending' && $u['role'] !== 'admin') {
-            echo "<form method='post' style='display:inline;'><input type='hidden' name='id' value='{$u['id']}'><button name='approve' class='btn btn-sm'>✅ Approve</button></form> ";
-            echo "<form method='post' style='display:inline;'><input type='hidden' name='id' value='{$u['id']}'><button name='reject' class='btn btn-sm btn-danger'>❌ Reject</button></form>";
-        }
-        echo "</td></tr>";
-    }
-    echo "</table>";
-}
-
-function include_page_mailing() {
-    $db = getDB();
-    $notifs = $db->query("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 20")->fetchAll();
-    echo "<h2>📧 Mailing & News</h2>";
-    echo "<div class='card'><h3>🔔 Notifications</h3>";
-    foreach ($notifs as $n) echo "<p>".($n['is_read']?'📭':'📬')." {$n['message']} <small>{$n['created_at']}</small></p>";
-    echo "</div>";
-    echo "<div class='card'><h3>📰 CNN Indonesia</h3><div id='news'>Loading...</div></div>";
-    ?><script>
-        fetch('https://api.allorigins.win/get?url='+encodeURIComponent('https://www.cnnindonesia.com/rss'))
-            .then(r=>r.json()).then(d=>{
-                const xml = new DOMParser().parseFromString(d.contents,'text/xml');
-                let h='';
-                xml.querySelectorAll('item').forEach((item,i)=>{if(i>=10)return;
-                    h+=`<p><a href="${item.querySelector('link')?.textContent}" target="_blank">${item.querySelector('title')?.textContent}</a></p>`;
-                });
-                document.getElementById('news').innerHTML=h||'No news';
-            });
-    </script><?php
-}
-
-function include_page_maintools() {
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['cmdb_file'])) {
-        $data = parseExcel($_FILES['cmdb_file']['tmp_name']);
-        if ($data) {
-            $stdHeaders = ['Site ID*','Site Name*','Region(Site)*','Longitude','Latitude','MC Cluster','Circle ID'];
-            $norm = [];
-            foreach ($data as $row) {
-                $r = [];
-                foreach ($stdHeaders as $h) $r[$h] = $row[$h] ?? '';
-                $norm[] = $r;
-            }
-            saveCmdb($norm);
-            echo '<div class="alert alert-success">✅ Berhasil upload '.count($norm).' records.</div>';
-        } else echo '<div class="alert alert-error">❌ Gagal membaca file.</div>';
-    }
-    $count = count(loadCmdb());
-    echo "<h2>💾 Main Tools - CMDB Database</h2>";
-    echo "<div class='card'><p>Total sites: <strong>".number_format($count)."</strong></p></div>";
-    echo "<div class='card'><h3>Upload Excel (CMDB)</h3><form method='post' enctype='multipart/form-data'><input type='file' name='cmdb_file' accept='.xlsx,.xls,.csv' required><button class='btn' style='margin-top:8px;'>Upload & Process</button></form></div>";
-}
-
-function include_page_ran() {
-    $results = null;
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['query'])) {
-        $data = loadCmdb();
-        if (empty($data)) {
-            echo '<div class="alert alert-error">Database CMDB kosong.</div>';
-        } else {
-            $type = $_POST['type'];
-            $q = trim($_POST['query']);
-            $results = [];
-            if ($type === 'single') {
-                foreach ($data as $r) if(stripos($r['Site ID*']??'',$q)!==false || stripos($r['Site Name*']??'',$q)!==false) $results[]=$r;
-            } else {
-                $ids = array_map('trim', explode(',', $q));
-                foreach ($data as $r) if(in_array($r['Site ID*']??'', $ids)) $results[]=$r;
-            }
-        }
-    }
-    echo "<h2>📊 Tools RAN</h2><form method='post' style='display:flex; gap:10px;'><select name='type'><option value='single'>Single</option><option value='multiple'>Multiple</option></select><input name='query' placeholder='Site ID/Name' required style='flex:1;'><button class='btn'>Search</button></form>";
-    if ($results !== null) {
-        echo "<h3>Results (".count($results).")</h3><table><tr><th>Site ID</th><th>Site Name</th><th>Region</th></tr>";
-        foreach ($results as $r) echo "<tr><td>".h($r['Site ID*'])."</td><td>".h($r['Site Name*'])."</td><td>".h($r['Region(Site)*'])."</td></tr>";
-        echo "</table>";
-    }
-}
-
-function include_page_incident() {
-    $matched = $chartData = null;
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['incident_file'])) {
-        $down = parseExcel($_FILES['incident_file']['tmp_name']);
-        $cmdb = loadCmdb();
-        if (empty($cmdb)) {
-            echo '<div class="alert alert-error">Database CMDB belum diupload.</div>';
-        } elseif ($down) {
-            $activeIds = array_column($cmdb, 'Site ID*');
-            $matched = []; $chartData = [];
-            foreach ($down as $d) {
-                $sid = $d['Site ID*'] ?? '';
-                if (in_array($sid, $activeIds)) {
-                    $idx = array_search($sid, $activeIds);
-                    $d['Longitude'] = $cmdb[$idx]['Longitude'] ?? '';
-                    $d['Latitude'] = $cmdb[$idx]['Latitude'] ?? '';
-                    $d['MC Cluster'] = $cmdb[$idx]['MC Cluster'] ?? 'Unknown';
-                    $matched[] = $d;
-                    $mc = $d['MC Cluster'];
-                    $chartData[$mc] = ($chartData[$mc]??0)+1;
-                }
-            }
-        }
-    }
-    echo "<h2>⚠️ Massive Incident Tools</h2><form method='post' enctype='multipart/form-data'><input type='file' name='incident_file' accept='.xlsx,.xls,.csv' required><button class='btn'>Analyze</button></form>";
-    if ($matched !== null) {
-        echo "<h3>Down Sites: ".count($matched)."</h3>";
-        echo "<div class='card'><div id='incidentMap' style='height:400px;'></div></div>";
-        echo "<div class='card'><canvas id='incidentChart' style='max-height:300px;'></canvas></div>";
-        echo "<table><tr><th>Site ID</th><th>Site Name</th><th>MC Cluster</th></tr>";
-        foreach ($matched as $r) echo "<tr><td>".h($r['Site ID*'])."</td><td>".h($r['Site Name*'])."</td><td>".h($r['MC Cluster'])."</td></tr>";
-        echo "</table>";
-        ?><script>
-            document.addEventListener('DOMContentLoaded', function(){
-                var map = L.map('incidentMap').setView([-2.5,118],5);
-                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-                <?php foreach ($matched as $r): if(is_numeric($r['Latitude']) && is_numeric($r['Longitude'])): ?>
-                L.circleMarker([<?=$r['Latitude']?>,<?=$r['Longitude']?>],{color:'red'}).addTo(map).bindPopup("<?=$r['Site ID*']?>");
-                <?php endif; endforeach; ?>
-                new Chart(document.getElementById('incidentChart'),{
-                    type:'bar',
-                    data:{labels:<?=json_encode(array_keys($chartData))?>,datasets:[{label:'Down Sites',data:<?=json_encode(array_values($chartData))?>,backgroundColor:'#ef4444'}]}
-                });
-            });
-        </script><?php
-    }
-}
-
-function include_page_compiler() {
-    $download = null;
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['excel_files'])) {
-        $all = [];
-        foreach ($_FILES['excel_files']['tmp_name'] as $i => $tmp) {
-            if ($_FILES['excel_files']['error'][$i] === UPLOAD_ERR_OK) {
-                $data = parseExcel($tmp);
-                if ($data) $all = array_merge($all, $data);
-            }
-        }
-        if ($all) {
-            $fname = 'compiled_'.date('Ymd_His').'.csv';
-            $fp = fopen(UPLOADS_PATH.'/'.$fname, 'w');
-            fputcsv($fp, array_keys($all[0]));
-            foreach ($all as $row) fputcsv($fp, $row);
-            fclose($fp);
-            $download = "?download=1&type=compiled&file=".urlencode($fname);
-        } else echo '<div class="alert alert-error">Tidak ada data.</div>';
-    }
-    echo "<h2>📑 Tools Compiler</h2>";
-    if ($download) echo "<a href='$download' class='btn'>⬇️ Download Compiled</a> <a href='?page=tools_compiler' class='btn' style='background:#64748b;'>Clear Cache</a>";
-    echo "<form method='post' enctype='multipart/form-data'><input type='file' name='excel_files[]' multiple required><button class='btn'>Compile</button></form>";
-}
-
-function include_page_mapping() {
-    $circle = $_GET['circle'] ?? 'all';
-    $data = loadCmdb();
-    if (empty($data)) { echo '<div class="alert alert-error">Database CMDB kosong.</div>'; return; }
-    $circles = array_unique(array_column($data, 'Circle ID'));
-    sort($circles);
-    if ($circle !== 'all') $data = array_values(array_filter($data, fn($r)=>($r['Circle ID']??'')==$circle));
-    echo "<h2>🗺️ Mapping Long Lat</h2>";
-    echo "<form method='get' style='display:flex; gap:10px;'><input type='hidden' name='page' value='tools_mapping'><select name='circle' onchange='this.form.submit()'><option value='all'>All Circles</option>";
-    foreach ($circles as $c) echo "<option value='$c' ".($circle==$c?'selected':'').">$c</option>";
-    echo "</select><a href='?download=1&type=mapping&circle=$circle' class='btn btn-sm'>Download CSV</a></form>";
-    echo "<div class='card' style='padding:0;'><div id='map' style='height:500px;'></div></div>";
-    echo "<table><tr><th>Site ID</th><th>Site Name</th><th>Region</th><th>MC Cluster</th></tr>";
-    foreach ($data as $r) echo "<tr><td>".h($r['Site ID*'])."</td><td>".h($r['Site Name*'])."</td><td>".h($r['Region(Site)*'])."</td><td>".h($r['MC Cluster'])."</td></tr>";
-    echo "</table>";
-    ?><script>
-        document.addEventListener('DOMContentLoaded', function(){
-            var map = L.map('map').setView([-2.5,118],5);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-            <?php foreach($data as $r): if(is_numeric($r['Latitude']) && is_numeric($r['Longitude'])): ?>
-            L.marker([<?=$r['Latitude']?>,<?=$r['Longitude']?>]).addTo(map).bindPopup("<?=$r['Site ID*']?>");
-            <?php endif; endforeach; ?>
-        });
-    </script><?php
-}
-
-function include_page_validate() {
-    $step = $_POST['step'] ?? 1;
-    $ok = $nok = $download = null;
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && $step == 1 && isset($_FILES['file1'], $_FILES['file2'])) {
-        $tmp1 = UPLOADS_PATH . '/val1_'.session_id(); move_uploaded_file($_FILES['file1']['tmp_name'], $tmp1);
-        $tmp2 = UPLOADS_PATH . '/val2_'.session_id(); move_uploaded_file($_FILES['file2']['tmp_name'], $tmp2);
-        $data1 = parseExcel($tmp1);
-        $data2 = parseExcel($tmp2);
-        if ($data1 && $data2) {
-            $_SESSION['val_data1'] = $data1; $_SESSION['val_data2'] = $data2;
-            $_SESSION['val_headers1'] = array_keys($data1[0]); $_SESSION['val_headers2'] = array_keys($data2[0]);
-            $_SESSION['val_origin'] = pathinfo($_FILES['file1']['name'], PATHINFO_FILENAME);
-            $step = 2;
-        } else echo '<div class="alert alert-error">Gagal membaca file.</div>';
-    }
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && $step == 2 && isset($_POST['target_col'], $_POST['match_col'])) {
-        $data1 = $_SESSION['val_data1']; $data2 = $_SESSION['val_data2'];
-        $lookup = array_map('trim', array_column($data2, $_POST['match_col']));
-        $ok = $nok = 0;
-        foreach ($data1 as &$row) {
-            $val = trim(strtolower($row[$_POST['target_col']] ?? ''));
-            if (in_array($val, $lookup)) { $row['Validation'] = 'Not OK'; $nok++; }
-            else { $row['Validation'] = 'OK'; $ok++; }
-        }
-        $fname = 'validasi_'.$_SESSION['val_origin'].'_'.date('Ymd_Hi').'.csv';
-        $fp = fopen(UPLOADS_PATH . '/' . $fname, 'w');
-        fputcsv($fp, array_keys($data1[0]));
-        foreach ($data1 as $row) fputcsv($fp, $row);
-        fclose($fp);
-        $download = "?download=1&type=validation&file=".urlencode($fname);
-        unset($_SESSION['val_data1'], $_SESSION['val_data2'], $_SESSION['val_headers1'], $_SESSION['val_headers2']);
-    }
-    echo "<h2>✅ Validate LTOA OWS</h2>";
-    if ($step == 1) {
-        echo "<form method='post' enctype='multipart/form-data'><input type='hidden' name='step' value='1'>";
-        echo "<label>File 1 (Source): <input type='file' name='file1' required></label><br>";
-        echo "<label>File 2 (Comparison): <input type='file' name='file2' required></label><br>";
-        echo "<button class='btn'>Upload Files</button></form>";
-    } elseif ($step == 2 && isset($_SESSION['val_headers1'])) {
-        echo "<form method='post'><input type='hidden' name='step' value='2'>";
-        echo "<label>Column in File 1: <select name='target_col'>";
-        foreach ($_SESSION['val_headers1'] as $h) echo "<option>$h</option>";
-        echo "</select></label><br>";
-        echo "<label>Column in File 2: <select name='match_col'>";
-        foreach ($_SESSION['val_headers2'] as $h) echo "<option>$h</option>";
-        echo "</select></label><br>";
-        echo "<button class='btn'>Run Validation</button></form>";
-    }
-    if ($ok !== null) {
-        echo "<div class='card'><p>✅ OK (Clear Alarm): <strong>$ok</strong></p><p>❌ Not OK: <strong>$nok</strong></p>";
-        echo "<a href='$download' class='btn'>⬇️ Download Result CSV</a></div>";
-    }
-}
-
-function include_page_knowledge() {
-    echo "<h2>📚 Knowledge Base</h2>";
-    echo "<div class='card'><button onclick=\"fetchWiki('Nokia Networks')\" class='btn'>Nokia</button> ";
-    echo "<button onclick=\"fetchWiki('Ericsson Radio System')\" class='btn'>Ericsson</button> ";
-    echo "<button onclick=\"fetchWiki('Huawei 5G')\" class='btn'>Huawei</button>";
-    echo "<div id='wiki' style='margin-top:10px;'></div></div>";
-    ?><script>
-    async function fetchWiki(topic) {
-        document.getElementById('wiki').innerHTML = 'Loading...';
-        try {
-            const r = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(topic)}`);
-            const d = await r.json();
-            document.getElementById('wiki').innerHTML = `<h4>${d.title}</h4><p>${d.extract}</p>`;
-        } catch(e) { document.getElementById('wiki').innerHTML = 'Gagal mengambil data.'; }
-    }
-    </script><?php
-}
-?>
