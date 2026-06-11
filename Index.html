@@ -1,0 +1,776 @@
+<?php
+/**
+ * Network Technology Tools v5.2 – Single‑File Edition
+ * Letakkan di htdocs, akses langsung.
+ * Pastikan ekstensi PHP: sqlite3, zip, dom, mbstring aktif.
+ */
+session_start();
+error_reporting(0);
+ini_set('display_errors', 0);
+date_default_timezone_set('Asia/Jakarta');
+
+// ---------- KONFIGURASI & AUTO‑CREATE FOLDER ----------
+define('BASE_PATH', __DIR__);
+define('DB_PATH', BASE_PATH . '/_db');
+define('UPLOADS_PATH', BASE_PATH . '/_uploads');
+define('FOLDER_DB_PATH', BASE_PATH . '/folder_db');
+foreach ([DB_PATH, UPLOADS_PATH, FOLDER_DB_PATH] as $dir) {
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+        @file_put_contents($dir . '/index.html', '');
+    }
+}
+define('DB_FILE', DB_PATH . '/db_user.sqlite');
+define('HASH_COST', 12);
+define('ADMIN_USER', 'theo');
+define('ADMIN_PASS', 'theo@2026');        // Ganti setelah instalasi
+define('ADMIN_EMAIL', 'admin@local');
+
+// ---------- DATABASE SQLITE UNTUK USER ----------
+function getDB() {
+    static $pdo = null;
+    if ($pdo === null) {
+        try {
+            $pdo = new PDO('sqlite:' . DB_FILE);
+            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+            $pdo->exec('PRAGMA journal_mode=WAL');
+        } catch (PDOException $e) { die('Database error'); }
+    }
+    return $pdo;
+}
+function initDB() {
+    $db = getDB();
+    $db->exec("CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        full_name TEXT DEFAULT '',
+        role TEXT DEFAULT 'user',
+        status TEXT DEFAULT 'pending',
+        approved_by TEXT DEFAULT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_login DATETIME,
+        login_count INTEGER DEFAULT 0,
+        theme TEXT DEFAULT 'dark'
+    )");
+    $db->exec("CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        message TEXT,
+        type TEXT DEFAULT 'info',
+        is_read INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )");
+    $db->exec("CREATE TABLE IF NOT EXISTS activity_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        action TEXT,
+        details TEXT,
+        ip_address TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )");
+    // Buat admin default jika belum ada
+    $stmt = $db->prepare("SELECT id FROM users WHERE username = ?");
+    $stmt->execute([ADMIN_USER]);
+    if (!$stmt->fetch()) {
+        $hashed = password_hash(ADMIN_PASS, PASSWORD_BCRYPT, ['cost' => HASH_COST]);
+        $db->prepare("INSERT INTO users (username,password,email,full_name,role,status) VALUES (?,?,?,?,?,?)")
+           ->execute([ADMIN_USER, $hashed, ADMIN_EMAIL, 'Administrator', 'admin', 'approved']);
+    }
+}
+initDB();
+
+// ---------- FUNGSI UMUM ----------
+function h($s) { return htmlspecialchars($s ?? '', ENT_QUOTES, 'UTF-8'); }
+function csrf_token() {
+    if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32));
+    return $_SESSION['csrf'];
+}
+function verify_csrf($token) { return hash_equals($_SESSION['csrf'] ?? '', $token ?? ''); }
+function is_logged() { return !empty($_SESSION['user_id']); }
+function is_admin() { return ($_SESSION['user_role'] ?? '') === 'admin'; }
+function require_login() { if (!is_logged()) { header('Location: ?login'); exit; } }
+function login($u, $p) {
+    $db = getDB();
+    $stmt = $db->prepare("SELECT * FROM users WHERE username = ? AND status = 'approved'");
+    $stmt->execute([$u]);
+    $user = $stmt->fetch();
+    if ($user && password_verify($p, $user['password'])) {
+        session_regenerate_id(true);
+        $_SESSION['user_id'] = $user['id'];
+        $_SESSION['username'] = $user['username'];
+        $_SESSION['user_role'] = $user['role'];
+        $_SESSION['user_theme'] = $user['theme'];
+        $db->prepare("UPDATE users SET last_login=CURRENT_TIMESTAMP, login_count=login_count+1 WHERE id=?")->execute([$user['id']]);
+        $db->prepare("INSERT INTO activity_log (user_id,action,ip_address) VALUES (?,?,?)")->execute([$user['id'],'login',$_SERVER['REMOTE_ADDR']]);
+        return true;
+    }
+    return false;
+}
+function register_user($data) {
+    $db = getDB();
+    $hashed = password_hash($data['password'], PASSWORD_BCRYPT, ['cost' => HASH_COST]);
+    $stmt = $db->prepare("INSERT INTO users (username,password,email,full_name,role,status) VALUES (?,?,?,?,?,?)");
+    $stmt->execute([$data['username'], $hashed, $data['email'], $data['full_name'], 'user', 'pending']);
+    $admin_id = $db->query("SELECT id FROM users WHERE role='admin' LIMIT 1")->fetchColumn();
+    if ($admin_id) {
+        $db->prepare("INSERT INTO notifications (user_id,message,type) VALUES (?,?,?)")
+           ->execute([$admin_id, "New registration: {$data['username']} ({$data['email']})", 'new_registration']);
+    }
+}
+
+// ---------- FUNGSI EXCEL (CSV & XLSX) ----------
+function parseExcel($filePath) {
+    $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+    if ($ext === 'csv') {
+        $rows = [];
+        if (($handle = fopen($filePath, 'r')) !== false) {
+            $headers = fgetcsv($handle);
+            if (!$headers) return [];
+            $headers = array_map('trim', $headers);
+            while (($row = fgetcsv($handle)) !== false) {
+                $r = [];
+                foreach ($headers as $i => $h) $r[$h] = $row[$i] ?? '';
+                $rows[] = $r;
+            }
+            fclose($handle);
+        }
+        return $rows;
+    } elseif (in_array($ext, ['xlsx', 'xls'])) {
+        if ($ext === 'xlsx' && class_exists('ZipArchive')) {
+            $zip = new ZipArchive();
+            if ($zip->open($filePath) === true) {
+                $sharedStrings = [];
+                if (($ssXml = $zip->getFromName('xl/sharedStrings.xml')) !== false) {
+                    $ssDom = new DOMDocument();
+                    $ssDom->loadXML($ssXml);
+                    foreach ($ssDom->getElementsByTagName('si') as $si) $sharedStrings[] = $si->textContent;
+                }
+                $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
+                if ($sheetXml) {
+                    $sheetDom = new DOMDocument();
+                    $sheetDom->loadXML($sheetXml);
+                    $rows = $sheetDom->getElementsByTagName('row');
+                    $headers = [];
+                    $data = [];
+                    $rowIdx = 0;
+                    foreach ($rows as $row) {
+                        $cells = $row->getElementsByTagName('c');
+                        $rowData = [];
+                        $colIdx = 0;
+                        foreach ($cells as $cell) {
+                            $type = $cell->getAttribute('t');
+                            $v = $cell->getElementsByTagName('v')->item(0);
+                            $val = '';
+                            if ($v) {
+                                $val = $v->textContent;
+                                if ($type === 's' && isset($sharedStrings[(int)$val])) $val = $sharedStrings[(int)$val];
+                            }
+                            if ($rowIdx === 0) $headers[$colIdx] = $val;
+                            else $rowData[$headers[$colIdx] ?? "col$colIdx"] = $val;
+                            $colIdx++;
+                        }
+                        if ($rowIdx > 0) $data[] = $rowData;
+                        $rowIdx++;
+                    }
+                    $zip->close();
+                    return $data;
+                }
+                $zip->close();
+            }
+        }
+    }
+    return [];
+}
+
+// ---------- CMDB JSON HANDLER ----------
+function cmdbFilePath() { return FOLDER_DB_PATH . '/cmdb_database.json'; }
+function loadCmdb() {
+    $file = cmdbFilePath();
+    if (!file_exists($file)) return [];
+    $size = filesize($file);
+    if ($size > 5 * 1024 * 1024) {
+        $all = [];
+        $i = 0;
+        while (file_exists(FOLDER_DB_PATH . "/cmdb_chunk_{$i}.json")) {
+            $chunk = json_decode(file_get_contents(FOLDER_DB_PATH . "/cmdb_chunk_{$i}.json"), true);
+            if ($chunk) $all = array_merge($all, $chunk);
+            $i++;
+        }
+        return $all;
+    }
+    return json_decode(file_get_contents($file), true) ?: [];
+}
+function saveCmdb(array $data, $chunkSize = 5000) {
+    foreach (glob(FOLDER_DB_PATH . '/cmdb_chunk_*.json') as $f) unlink($f);
+    file_put_contents(cmdbFilePath(), json_encode($data, JSON_PRETTY_PRINT));
+    $chunks = array_chunk($data, $chunkSize);
+    foreach ($chunks as $i => $chunk) {
+        file_put_contents(FOLDER_DB_PATH . "/cmdb_chunk_{$i}.json", json_encode($chunk, JSON_PRETTY_PRINT));
+    }
+}
+
+// ---------- DOWNLOAD CSV ----------
+if (isset($_GET['download'])) {
+    require_login();
+    $type = $_GET['type'] ?? '';
+    if ($type === 'mapping') {
+        $circle = $_GET['circle'] ?? 'all';
+        $data = loadCmdb();
+        if ($circle !== 'all') $data = array_values(array_filter($data, fn($r) => ($r['Circle ID'] ?? '') == $circle));
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="mapping_'.date('Ymd_His').'.csv"');
+        $out = fopen('php://output', 'w');
+        if (!empty($data)) {
+            fputcsv($out, array_keys($data[0]));
+            foreach ($data as $row) fputcsv($out, $row);
+        }
+        fclose($out);
+        exit;
+    } elseif ($type === 'compiled' && isset($_GET['file'])) {
+        $file = basename($_GET['file']);
+        $path = UPLOADS_PATH . '/' . $file;
+        if (file_exists($path)) {
+            header('Content-Type: text/csv');
+            header('Content-Disposition: attachment; filename="' . $file . '"');
+            readfile($path);
+            exit;
+        }
+    } elseif ($type === 'validation' && isset($_GET['file'])) {
+        $file = basename($_GET['file']);
+        $path = UPLOADS_PATH . '/' . $file;
+        if (file_exists($path)) {
+            header('Content-Type: text/csv');
+            header('Content-Disposition: attachment; filename="' . $file . '"');
+            readfile($path);
+            exit;
+        }
+    }
+    exit('Invalid download');
+}
+
+// ---------- PROSES FORM LOGIN/REGISTER ----------
+$error = $success = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_POST['action']) && $_POST['action'] === 'login') {
+        if (!verify_csrf($_POST['csrf'] ?? '')) $error = 'Invalid CSRF';
+        elseif (login($_POST['username'], $_POST['password'])) { header('Location: ?'); exit; }
+        else $error = 'Invalid credentials or account not approved.';
+    }
+    elseif (isset($_POST['action']) && $_POST['action'] === 'register') {
+        if (!verify_csrf($_POST['csrf'] ?? '')) $error = 'Invalid CSRF';
+        else {
+            if (strlen($_POST['password']) < 8) $error = 'Password minimal 8 karakter.';
+            else {
+                register_user([
+                    'full_name' => $_POST['full_name'],
+                    'username' => $_POST['username'],
+                    'email' => $_POST['email'],
+                    'password' => $_POST['password'],
+                ]);
+                header('Location: ?login&registered=1'); exit;
+            }
+        }
+    }
+}
+
+// ---------- HALAMAN LOGIN/REGISTER (jika belum login) ----------
+if (!is_logged()) {
+    $mode = isset($_GET['register']) ? 'register' : 'login';
+    ?>
+    <!DOCTYPE html>
+    <html data-theme="dark">
+    <head><title>Network Tech Tools - Login</title>
+    <style>
+        :root { --bg:#0a0e17; --card:rgba(17,24,39,0.9); --text:#e2e8f0; --accent:#00d4ff; }
+        *{margin:0;padding:0;box-sizing:border-box;}
+        body{background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;background:linear-gradient(135deg, #0a0e17 0%, #1a1a2e 100%);}
+        .card{background:var(--card);border-radius:20px;padding:40px;width:100%;max-width:400px;backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.1);}
+        input{width:100%;padding:12px;margin:8px 0;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:var(--text);}
+        button{width:100%;padding:12px;background:var(--accent);border:none;border-radius:8px;font-weight:bold;cursor:pointer;margin-top:10px;transition:0.3s;}
+        button:hover{opacity:0.9;}
+        .alert{padding:10px;border-radius:6px;margin-bottom:10px;}
+        .error{background:#7f1d1d;color:#fca5a5;}
+        .success{background:#064e3b;color:#6ee7b7;}
+        a{color:var(--accent);}
+    </style>
+    </head>
+    <body>
+    <div class="card">
+        <h2 style="text-align:center;">📡 Network Tech Tools</h2>
+        <?php if($error): ?><div class="alert error"><?=$error?></div><?php endif; ?>
+        <?php if(isset($_GET['registered'])): ?><div class="alert success">Registrasi berhasil. Silakan login setelah disetujui admin.</div><?php endif; ?>
+        <?php if($mode === 'login'): ?>
+            <form method="post">
+                <input type="hidden" name="action" value="login">
+                <input type="hidden" name="csrf" value="<?=csrf_token()?>">
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="password" name="password" placeholder="Password" required>
+                <button type="submit">Sign In</button>
+            </form>
+            <p style="text-align:center;margin-top:10px;">Belum punya akun? <a href="?register">Daftar</a></p>
+        <?php else: ?>
+            <form method="post">
+                <input type="hidden" name="action" value="register">
+                <input type="hidden" name="csrf" value="<?=csrf_token()?>">
+                <input type="text" name="full_name" placeholder="Nama Lengkap" required>
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="email" name="email" placeholder="Email" required>
+                <input type="password" name="password" placeholder="Password (min 8)" required>
+                <button type="submit">Daftar</button>
+            </form>
+            <p style="text-align:center;margin-top:10px;">Sudah punya akun? <a href="?login">Masuk</a></p>
+        <?php endif; ?>
+    </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+// ---------- USER SUDAH LOGIN ----------
+require_login();
+$user = getDB()->prepare("SELECT * FROM users WHERE id=?")->execute([$_SESSION['user_id']])->fetch();
+if (($_GET['action'] ?? '') === 'logout') {
+    session_destroy();
+    header('Location: ?login');
+    exit;
+}
+if (isset($_GET['theme'])) {
+    $newTheme = $_GET['theme'] === 'light' ? 'light' : 'dark';
+    getDB()->prepare("UPDATE users SET theme=? WHERE id=?")->execute([$newTheme, $_SESSION['user_id']]);
+    $_SESSION['user_theme'] = $newTheme;
+    header('Location: ?');
+    exit;
+}
+$theme = $_SESSION['user_theme'] ?? 'dark';
+
+// Routing halaman
+$page = $_GET['page'] ?? 'home';
+$allowed = ['home','adm_user','mailing_news','tools_ran','massive_incident','tools_compiler','tools_mapping','tools_validate','main_tools','knowledge'];
+if (!in_array($page, $allowed)) $page = 'home';
+if ($page === 'adm_user' && !is_admin()) $page = 'home';
+
+// Include konten halaman
+ob_start();
+switch ($page) {
+    case 'home': include_page_home(); break;
+    case 'adm_user': include_page_admin_users(); break;
+    case 'mailing_news': include_page_mailing(); break;
+    case 'tools_ran': include_page_ran(); break;
+    case 'massive_incident': include_page_incident(); break;
+    case 'tools_compiler': include_page_compiler(); break;
+    case 'tools_mapping': include_page_mapping(); break;
+    case 'tools_validate': include_page_validate(); break;
+    case 'main_tools': include_page_maintools(); break;
+    case 'knowledge': include_page_knowledge(); break;
+}
+$content = ob_get_clean();
+
+// Peringatan jika CMDB kosong untuk beberapa halaman
+$cmdb_warning = '';
+if (in_array($page, ['tools_ran','massive_incident','tools_mapping']) && empty(loadCmdb())) {
+    $cmdb_warning = '<script>alert("⚠️ Database CMDB belum diupload. Silakan upload melalui Main Tools terlebih dahulu.");</script>';
+}
+?>
+<!DOCTYPE html>
+<html data-theme="<?=$theme?>">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Network Technology Tools</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --sidebar-w: 260px; --header-h: 60px;
+            --bg: #0a0e17; --bg2: #111827; --card: rgba(17,24,39,0.8);
+            --text: #e2e8f0; --text2: #94a3b8; --accent: #00d4ff;
+            --border: rgba(255,255,255,0.06); --hover: rgba(255,255,255,0.03);
+        }
+        [data-theme="light"] {
+            --bg: #f8fafc; --bg2: #fff; --card: rgba(255,255,255,0.9);
+            --text: #1e293b; --text2: #64748b; --border: rgba(0,0,0,0.08); --hover: rgba(0,0,0,0.02);
+        }
+        *{margin:0;padding:0;box-sizing:border-box;}
+        body{font-family:'Segoe UI', system-ui, sans-serif; background:var(--bg); color:var(--text); display:flex; min-height:100vh; transition: background 0.3s;}
+        .sidebar{width:var(--sidebar-w); height:100vh; position:fixed; left:0; top:0; background:var(--bg2); border-right:1px solid var(--border); display:flex; flex-direction:column; z-index:100; overflow-y:auto; padding:20px 0; transition: transform 0.3s;}
+        .sidebar a, .sidebar button{display:flex; align-items:center; gap:8px; padding:10px 16px; margin:2px 8px; border-radius:8px; color:var(--text2); text-decoration:none; font-size:0.9rem; background:none; border:none; width:calc(100% - 16px); cursor:pointer; text-align:left; transition: 0.2s;}
+        .sidebar a:hover, .sidebar a.active{background:var(--hover); color:var(--text);}
+        .sidebar a.active{background:rgba(0,212,255,0.1); color:var(--accent); font-weight:600;}
+        .badge{background:#ef4444; color:white; border-radius:10px; padding:2px 8px; font-size:0.7rem; margin-left:auto;}
+        .submenu{display:none; padding-left:16px;}
+        .submenu.open{display:block;}
+        .main{margin-left:var(--sidebar-w); flex:1; display:flex; flex-direction:column; transition: margin 0.3s;}
+        .topbar{height:var(--header-h); background:var(--bg2); border-bottom:1px solid var(--border); display:flex; align-items:center; padding:0 20px; gap:12px; position:sticky; top:0; z-index:50;}
+        .content{flex:1; padding:20px; overflow-y:auto; animation: fadeIn 0.4s;}
+        @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+        .card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:20px; margin-bottom:20px; backdrop-filter:blur(8px);}
+        .btn{display:inline-block; padding:8px 16px; background:var(--accent); color:#000; border:none; border-radius:8px; cursor:pointer; text-decoration:none; font-weight:600; transition:0.2s;}
+        .btn:hover{opacity:0.9; transform:translateY(-1px);}
+        .btn-sm{padding:4px 10px; font-size:0.85rem;}
+        .btn-danger{background:#ef4444; color:white;}
+        table{width:100%; border-collapse:collapse;}
+        th, td{padding:10px; border-bottom:1px solid var(--border); text-align:left; font-size:0.9rem;}
+        th{background:var(--hover); position:sticky; top:0;}
+        input, select, textarea{background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:10px; color:var(--text); width:100%; margin:4px 0;}
+        .alert{padding:12px; border-radius:8px; margin-bottom:16px;}
+        .alert-success{background:rgba(16,185,129,0.2); color:#6ee7b7;}
+        .alert-error{background:rgba(239,68,68,0.2); color:#fca5a5;}
+        #globalLoader{position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); display:none; align-items:center; justify-content:center; z-index:9999;}
+        .loader{width:50px; height:50px; border:3px solid rgba(255,255,255,0.2); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite;}
+        @keyframes spin { to{transform:rotate(360deg);} }
+    </style>
+</head>
+<body>
+<div id="globalLoader"><div class="loader"></div></div>
+<aside class="sidebar" id="sidebar">
+    <div style="padding:0 16px 20px; border-bottom:1px solid var(--border); margin-bottom:10px;">
+        <div style="font-size:1.5rem;">📡</div>
+        <strong>Network Tech Tools</strong>
+    </div>
+    <a href="?page=home" class="<?=$page=='home'?'active':''?>">🏠 Home</a>
+    <?php if(is_admin()): ?>
+    <a href="?page=adm_user" class="<?=$page=='adm_user'?'active':''?>">👥 User Approval <?php $p = getDB()->query("SELECT count(*) FROM users WHERE status='pending'")->fetchColumn(); if($p) echo "<span class='badge'>$p</span>"; ?></a>
+    <?php endif; ?>
+    <a href="?page=mailing_news" class="<?=$page=='mailing_news'?'active':''?>">📧 Mailing & News</a>
+    <button onclick="toggleSubmenu()" class="nav-item">🔧 Tools Suite ▾</button>
+    <div id="submenu" class="submenu <?=in_array($page,['tools_ran','massive_incident','tools_compiler','tools_mapping','tools_validate','main_tools'])?'open':''?>">
+        <a href="?page=tools_ran" class="<?=$page=='tools_ran'?'active':''?>">📊 Tools RAN</a>
+        <a href="?page=massive_incident" class="<?=$page=='massive_incident'?'active':''?>">⚠️ Massive Incident</a>
+        <a href="?page=tools_compiler" class="<?=$page=='tools_compiler'?'active':''?>">📑 Tools Compiler</a>
+        <a href="?page=tools_mapping" class="<?=$page=='tools_mapping'?'active':''?>">🗺️ Mapping Long Lat</a>
+        <a href="?page=tools_validate" class="<?=$page=='tools_validate'?'active':''?>">✅ Validate LTOA OWS</a>
+        <a href="?page=main_tools" class="<?=$page=='main_tools'?'active':''?>">💾 Main Tools (CMDB)</a>
+    </div>
+    <a href="?page=knowledge" class="<?=$page=='knowledge'?'active':''?>">📚 Knowledge Base</a>
+    <a href="?action=logout" style="color:#ef4444;">🚪 Logout</a>
+</aside>
+
+<div class="main">
+    <header class="topbar">
+        <button onclick="document.getElementById('sidebar').classList.toggle('open')" style="display:none; background:none; border:none; font-size:1.5rem; color:var(--text);">☰</button>
+        <span id="weather">⏳</span>
+        <span style="flex:1;"></span>
+        <span id="clock"></span>
+        <a href="?theme=<?=$theme=='dark'?'light':'dark'?>" style="font-size:1.4rem; text-decoration:none;"><?=$theme=='dark'?'☀️':'🌙'?></a>
+        <span style="margin-left:8px;"><?=h($user['username'])?></span>
+    </header>
+    <div class="content">
+        <?=$content?>
+    </div>
+</div>
+
+<?=$cmdb_warning?>
+
+<script>
+    window.showLoader = () => document.getElementById('globalLoader').style.display = 'flex';
+    window.hideLoader = () => document.getElementById('globalLoader').style.display = 'none';
+    window.addEventListener('load', hideLoader);
+    document.querySelectorAll('form').forEach(f => f.addEventListener('submit', showLoader));
+
+    function toggleSubmenu() {
+        document.getElementById('submenu').classList.toggle('open');
+    }
+
+    function updateClock() {
+        const now = new Date();
+        document.getElementById('clock').textContent = now.toLocaleTimeString('en-ID', {timeZone:'Asia/Jakarta', hour:'2-digit', minute:'2-digit', second:'2-digit'}) + ' WIB';
+    }
+    setInterval(updateClock, 1000); updateClock();
+
+    async function fetchWeather() {
+        try {
+            const res = await fetch('https://api.open-meteo.com/v1/forecast?latitude=-6.2088&longitude=106.8456&current_weather=true&timezone=Asia/Jakarta');
+            const data = await res.json();
+            if (data.current_weather) {
+                const w = data.current_weather;
+                const emoji = {0:'☀️',1:'🌤️',2:'⛅',3:'☁️',45:'🌫️',51:'🌦️',61:'🌧️',80:'⛈️'}[w.weathercode] || '🌡️';
+                document.getElementById('weather').innerHTML = `${emoji} ${w.temperature}°C Jakarta`;
+            }
+        } catch(e) {}
+    }
+    fetchWeather(); setInterval(fetchWeather, 600000);
+</script>
+</body>
+</html>
+<?php
+// ========== DEFINISI HALAMAN ==========
+function include_page_home() {
+    $db = getDB();
+    $totalSites = count(loadCmdb());
+    $totalUsers = $db->query("SELECT count(*) FROM users")->fetchColumn();
+    $pending = $db->query("SELECT count(*) FROM users WHERE status='pending'")->fetchColumn();
+    echo "<h2>📊 Dashboard Overview</h2>";
+    echo "<div style='display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:16px;'>";
+    echo "<div class='card' style='text-align:center;'><h3>".number_format($totalSites)."</h3><p>Total Sites</p></div>";
+    echo "<div class='card' style='text-align:center;'><h3>{$totalUsers}</h3><p>Users</p></div>";
+    echo "<div class='card' style='text-align:center;'><h3>{$pending}</h3><p>Pending Approval</p></div>";
+    echo "</div>";
+    echo "<div class='card'><h3>Quick Actions</h3><a href='?page=main_tools' class='btn'>Upload CMDB</a> <a href='?page=tools_mapping' class='btn'>Mapping</a></div>";
+}
+
+function include_page_admin_users() {
+    $db = getDB();
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['approve'])) {
+        $db->prepare("UPDATE users SET status='approved', approved_by=? WHERE id=?")->execute([$_SESSION['username'], (int)$_POST['id']]);
+        echo '<div class="alert alert-success">User approved.</div>';
+    } elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reject'])) {
+        $db->prepare("DELETE FROM users WHERE id=? AND role!='admin'")->execute([(int)$_POST['id']]);
+        echo '<div class="alert alert-error">User rejected.</div>';
+    }
+    $users = $db->query("SELECT * FROM users ORDER BY created_at DESC")->fetchAll();
+    echo "<h2>👥 User Approval</h2><table>";
+    echo "<tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Status</th><th>Action</th></tr>";
+    foreach ($users as $u) {
+        echo "<tr><td>".h($u['username'])."</td><td>".h($u['full_name'])."</td><td>".h($u['email'])."</td><td>{$u['role']}</td><td>{$u['status']}</td><td>";
+        if ($u['status'] === 'pending' && $u['role'] !== 'admin') {
+            echo "<form method='post' style='display:inline;'><input type='hidden' name='id' value='{$u['id']}'><button name='approve' class='btn btn-sm'>✅ Approve</button></form> ";
+            echo "<form method='post' style='display:inline;'><input type='hidden' name='id' value='{$u['id']}'><button name='reject' class='btn btn-sm btn-danger'>❌ Reject</button></form>";
+        }
+        echo "</td></tr>";
+    }
+    echo "</table>";
+}
+
+function include_page_mailing() {
+    $db = getDB();
+    $notifs = $db->query("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 20")->fetchAll();
+    echo "<h2>📧 Mailing & News</h2>";
+    echo "<div class='card'><h3>🔔 Notifications</h3>";
+    foreach ($notifs as $n) echo "<p>".($n['is_read']?'📭':'📬')." {$n['message']} <small>{$n['created_at']}</small></p>";
+    echo "</div>";
+    echo "<div class='card'><h3>📰 CNN Indonesia</h3><div id='news'>Loading...</div></div>";
+    ?><script>
+        fetch('https://api.allorigins.win/get?url='+encodeURIComponent('https://www.cnnindonesia.com/rss'))
+            .then(r=>r.json()).then(d=>{
+                const xml = new DOMParser().parseFromString(d.contents,'text/xml');
+                let h='';
+                xml.querySelectorAll('item').forEach((item,i)=>{if(i>=10)return;
+                    h+=`<p><a href="${item.querySelector('link')?.textContent}" target="_blank">${item.querySelector('title')?.textContent}</a></p>`;
+                });
+                document.getElementById('news').innerHTML=h||'No news';
+            });
+    </script><?php
+}
+
+function include_page_maintools() {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['cmdb_file'])) {
+        $data = parseExcel($_FILES['cmdb_file']['tmp_name']);
+        if ($data) {
+            $stdHeaders = ['Site ID*','Site Name*','Region(Site)*','Longitude','Latitude','MC Cluster','Circle ID'];
+            $norm = [];
+            foreach ($data as $row) {
+                $r = [];
+                foreach ($stdHeaders as $h) $r[$h] = $row[$h] ?? '';
+                $norm[] = $r;
+            }
+            saveCmdb($norm);
+            echo '<div class="alert alert-success">✅ Berhasil upload '.count($norm).' records.</div>';
+        } else echo '<div class="alert alert-error">❌ Gagal membaca file.</div>';
+    }
+    $count = count(loadCmdb());
+    echo "<h2>💾 Main Tools - CMDB Database</h2>";
+    echo "<div class='card'><p>Total sites: <strong>".number_format($count)."</strong></p></div>";
+    echo "<div class='card'><h3>Upload Excel (CMDB)</h3><form method='post' enctype='multipart/form-data'><input type='file' name='cmdb_file' accept='.xlsx,.xls,.csv' required><button class='btn' style='margin-top:8px;'>Upload & Process</button></form></div>";
+}
+
+function include_page_ran() {
+    $results = null;
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['query'])) {
+        $data = loadCmdb();
+        if (empty($data)) {
+            echo '<div class="alert alert-error">Database CMDB kosong.</div>';
+        } else {
+            $type = $_POST['type'];
+            $q = trim($_POST['query']);
+            $results = [];
+            if ($type === 'single') {
+                foreach ($data as $r) if(stripos($r['Site ID*']??'',$q)!==false || stripos($r['Site Name*']??'',$q)!==false) $results[]=$r;
+            } else {
+                $ids = array_map('trim', explode(',', $q));
+                foreach ($data as $r) if(in_array($r['Site ID*']??'', $ids)) $results[]=$r;
+            }
+        }
+    }
+    echo "<h2>📊 Tools RAN</h2><form method='post' style='display:flex; gap:10px;'><select name='type'><option value='single'>Single</option><option value='multiple'>Multiple</option></select><input name='query' placeholder='Site ID/Name' required style='flex:1;'><button class='btn'>Search</button></form>";
+    if ($results !== null) {
+        echo "<h3>Results (".count($results).")</h3><table><tr><th>Site ID</th><th>Site Name</th><th>Region</th></tr>";
+        foreach ($results as $r) echo "<tr><td>".h($r['Site ID*'])."</td><td>".h($r['Site Name*'])."</td><td>".h($r['Region(Site)*'])."</td></tr>";
+        echo "</table>";
+    }
+}
+
+function include_page_incident() {
+    $matched = $chartData = null;
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['incident_file'])) {
+        $down = parseExcel($_FILES['incident_file']['tmp_name']);
+        $cmdb = loadCmdb();
+        if (empty($cmdb)) {
+            echo '<div class="alert alert-error">Database CMDB belum diupload.</div>';
+        } elseif ($down) {
+            $activeIds = array_column($cmdb, 'Site ID*');
+            $matched = []; $chartData = [];
+            foreach ($down as $d) {
+                $sid = $d['Site ID*'] ?? '';
+                if (in_array($sid, $activeIds)) {
+                    $idx = array_search($sid, $activeIds);
+                    $d['Longitude'] = $cmdb[$idx]['Longitude'] ?? '';
+                    $d['Latitude'] = $cmdb[$idx]['Latitude'] ?? '';
+                    $d['MC Cluster'] = $cmdb[$idx]['MC Cluster'] ?? 'Unknown';
+                    $matched[] = $d;
+                    $mc = $d['MC Cluster'];
+                    $chartData[$mc] = ($chartData[$mc]??0)+1;
+                }
+            }
+        }
+    }
+    echo "<h2>⚠️ Massive Incident Tools</h2><form method='post' enctype='multipart/form-data'><input type='file' name='incident_file' accept='.xlsx,.xls,.csv' required><button class='btn'>Analyze</button></form>";
+    if ($matched !== null) {
+        echo "<h3>Down Sites: ".count($matched)."</h3>";
+        echo "<div class='card'><div id='incidentMap' style='height:400px;'></div></div>";
+        echo "<div class='card'><canvas id='incidentChart' style='max-height:300px;'></canvas></div>";
+        echo "<table><tr><th>Site ID</th><th>Site Name</th><th>MC Cluster</th></tr>";
+        foreach ($matched as $r) echo "<tr><td>".h($r['Site ID*'])."</td><td>".h($r['Site Name*'])."</td><td>".h($r['MC Cluster'])."</td></tr>";
+        echo "</table>";
+        ?><script>
+            document.addEventListener('DOMContentLoaded', function(){
+                var map = L.map('incidentMap').setView([-2.5,118],5);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+                <?php foreach ($matched as $r): if(is_numeric($r['Latitude']) && is_numeric($r['Longitude'])): ?>
+                L.circleMarker([<?=$r['Latitude']?>,<?=$r['Longitude']?>],{color:'red'}).addTo(map).bindPopup("<?=$r['Site ID*']?>");
+                <?php endif; endforeach; ?>
+                new Chart(document.getElementById('incidentChart'),{
+                    type:'bar',
+                    data:{labels:<?=json_encode(array_keys($chartData))?>,datasets:[{label:'Down Sites',data:<?=json_encode(array_values($chartData))?>,backgroundColor:'#ef4444'}]}
+                });
+            });
+        </script><?php
+    }
+}
+
+function include_page_compiler() {
+    $download = null;
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['excel_files'])) {
+        $all = [];
+        foreach ($_FILES['excel_files']['tmp_name'] as $i => $tmp) {
+            if ($_FILES['excel_files']['error'][$i] === UPLOAD_ERR_OK) {
+                $data = parseExcel($tmp);
+                if ($data) $all = array_merge($all, $data);
+            }
+        }
+        if ($all) {
+            $fname = 'compiled_'.date('Ymd_His').'.csv';
+            $fp = fopen(UPLOADS_PATH.'/'.$fname, 'w');
+            fputcsv($fp, array_keys($all[0]));
+            foreach ($all as $row) fputcsv($fp, $row);
+            fclose($fp);
+            $download = "?download=1&type=compiled&file=".urlencode($fname);
+        } else echo '<div class="alert alert-error">Tidak ada data.</div>';
+    }
+    echo "<h2>📑 Tools Compiler</h2>";
+    if ($download) echo "<a href='$download' class='btn'>⬇️ Download Compiled</a> <a href='?page=tools_compiler' class='btn' style='background:#64748b;'>Clear Cache</a>";
+    echo "<form method='post' enctype='multipart/form-data'><input type='file' name='excel_files[]' multiple required><button class='btn'>Compile</button></form>";
+}
+
+function include_page_mapping() {
+    $circle = $_GET['circle'] ?? 'all';
+    $data = loadCmdb();
+    if (empty($data)) { echo '<div class="alert alert-error">Database CMDB kosong.</div>'; return; }
+    $circles = array_unique(array_column($data, 'Circle ID'));
+    sort($circles);
+    if ($circle !== 'all') $data = array_values(array_filter($data, fn($r)=>($r['Circle ID']??'')==$circle));
+    echo "<h2>🗺️ Mapping Long Lat</h2>";
+    echo "<form method='get' style='display:flex; gap:10px;'><input type='hidden' name='page' value='tools_mapping'><select name='circle' onchange='this.form.submit()'><option value='all'>All Circles</option>";
+    foreach ($circles as $c) echo "<option value='$c' ".($circle==$c?'selected':'').">$c</option>";
+    echo "</select><a href='?download=1&type=mapping&circle=$circle' class='btn btn-sm'>Download CSV</a></form>";
+    echo "<div class='card' style='padding:0;'><div id='map' style='height:500px;'></div></div>";
+    echo "<table><tr><th>Site ID</th><th>Site Name</th><th>Region</th><th>MC Cluster</th></tr>";
+    foreach ($data as $r) echo "<tr><td>".h($r['Site ID*'])."</td><td>".h($r['Site Name*'])."</td><td>".h($r['Region(Site)*'])."</td><td>".h($r['MC Cluster'])."</td></tr>";
+    echo "</table>";
+    ?><script>
+        document.addEventListener('DOMContentLoaded', function(){
+            var map = L.map('map').setView([-2.5,118],5);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+            <?php foreach($data as $r): if(is_numeric($r['Latitude']) && is_numeric($r['Longitude'])): ?>
+            L.marker([<?=$r['Latitude']?>,<?=$r['Longitude']?>]).addTo(map).bindPopup("<?=$r['Site ID*']?>");
+            <?php endif; endforeach; ?>
+        });
+    </script><?php
+}
+
+function include_page_validate() {
+    $step = $_POST['step'] ?? 1;
+    $ok = $nok = $download = null;
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && $step == 1 && isset($_FILES['file1'], $_FILES['file2'])) {
+        $tmp1 = UPLOADS_PATH . '/val1_'.session_id(); move_uploaded_file($_FILES['file1']['tmp_name'], $tmp1);
+        $tmp2 = UPLOADS_PATH . '/val2_'.session_id(); move_uploaded_file($_FILES['file2']['tmp_name'], $tmp2);
+        $data1 = parseExcel($tmp1);
+        $data2 = parseExcel($tmp2);
+        if ($data1 && $data2) {
+            $_SESSION['val_data1'] = $data1; $_SESSION['val_data2'] = $data2;
+            $_SESSION['val_headers1'] = array_keys($data1[0]); $_SESSION['val_headers2'] = array_keys($data2[0]);
+            $_SESSION['val_origin'] = pathinfo($_FILES['file1']['name'], PATHINFO_FILENAME);
+            $step = 2;
+        } else echo '<div class="alert alert-error">Gagal membaca file.</div>';
+    }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && $step == 2 && isset($_POST['target_col'], $_POST['match_col'])) {
+        $data1 = $_SESSION['val_data1']; $data2 = $_SESSION['val_data2'];
+        $lookup = array_map('trim', array_column($data2, $_POST['match_col']));
+        $ok = $nok = 0;
+        foreach ($data1 as &$row) {
+            $val = trim(strtolower($row[$_POST['target_col']] ?? ''));
+            if (in_array($val, $lookup)) { $row['Validation'] = 'Not OK'; $nok++; }
+            else { $row['Validation'] = 'OK'; $ok++; }
+        }
+        $fname = 'validasi_'.$_SESSION['val_origin'].'_'.date('Ymd_Hi').'.csv';
+        $fp = fopen(UPLOADS_PATH . '/' . $fname, 'w');
+        fputcsv($fp, array_keys($data1[0]));
+        foreach ($data1 as $row) fputcsv($fp, $row);
+        fclose($fp);
+        $download = "?download=1&type=validation&file=".urlencode($fname);
+        unset($_SESSION['val_data1'], $_SESSION['val_data2'], $_SESSION['val_headers1'], $_SESSION['val_headers2']);
+    }
+    echo "<h2>✅ Validate LTOA OWS</h2>";
+    if ($step == 1) {
+        echo "<form method='post' enctype='multipart/form-data'><input type='hidden' name='step' value='1'>";
+        echo "<label>File 1 (Source): <input type='file' name='file1' required></label><br>";
+        echo "<label>File 2 (Comparison): <input type='file' name='file2' required></label><br>";
+        echo "<button class='btn'>Upload Files</button></form>";
+    } elseif ($step == 2 && isset($_SESSION['val_headers1'])) {
+        echo "<form method='post'><input type='hidden' name='step' value='2'>";
+        echo "<label>Column in File 1: <select name='target_col'>";
+        foreach ($_SESSION['val_headers1'] as $h) echo "<option>$h</option>";
+        echo "</select></label><br>";
+        echo "<label>Column in File 2: <select name='match_col'>";
+        foreach ($_SESSION['val_headers2'] as $h) echo "<option>$h</option>";
+        echo "</select></label><br>";
+        echo "<button class='btn'>Run Validation</button></form>";
+    }
+    if ($ok !== null) {
+        echo "<div class='card'><p>✅ OK (Clear Alarm): <strong>$ok</strong></p><p>❌ Not OK: <strong>$nok</strong></p>";
+        echo "<a href='$download' class='btn'>⬇️ Download Result CSV</a></div>";
+    }
+}
+
+function include_page_knowledge() {
+    echo "<h2>📚 Knowledge Base</h2>";
+    echo "<div class='card'><button onclick=\"fetchWiki('Nokia Networks')\" class='btn'>Nokia</button> ";
+    echo "<button onclick=\"fetchWiki('Ericsson Radio System')\" class='btn'>Ericsson</button> ";
+    echo "<button onclick=\"fetchWiki('Huawei 5G')\" class='btn'>Huawei</button>";
+    echo "<div id='wiki' style='margin-top:10px;'></div></div>";
+    ?><script>
+    async function fetchWiki(topic) {
+        document.getElementById('wiki').innerHTML = 'Loading...';
+        try {
+            const r = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(topic)}`);
+            const d = await r.json();
+            document.getElementById('wiki').innerHTML = `<h4>${d.title}</h4><p>${d.extract}</p>`;
+        } catch(e) { document.getElementById('wiki').innerHTML = 'Gagal mengambil data.'; }
+    }
+    </script><?php
+}
+?>
